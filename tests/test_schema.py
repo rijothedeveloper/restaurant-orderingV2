@@ -3,12 +3,14 @@ import pytest
 
 from tests.factories import (
     create_category,
+    create_hours,
     create_menu_item,
     create_modifier_group,
     create_modifier_option,
     create_order,
     create_order_item,
     create_restaurant,
+    create_settings,
 )
 
 pytestmark = pytest.mark.integration
@@ -33,6 +35,7 @@ async def test_tables_exist(conn: asyncpg.Connection) -> None:
         "order_item_modifiers",
         "order_counters",
         "order_events",
+        "opening_hours",
     } <= tables
 
 
@@ -67,12 +70,14 @@ async def test_new_order_defaults_to_draft_without_a_number(
     assert row["order_number"] is None
     assert row["business_date"] is None
     assert row["placed_at"] is None
+    assert row["requested_pickup_at"] is None
+    assert row["promised_pickup_at"] is None
 
 
 PLACE = """
     UPDATE orders
     SET status = 'placed', order_number = $2, business_date = '2026-11-19',
-        placed_at = now()
+        placed_at = now(), promised_pickup_at = now()
     WHERE id = $1
 """
 
@@ -90,6 +95,14 @@ async def test_only_a_placed_order_has_a_number(conn: asyncpg.Connection) -> Non
         SET order_number = 1, business_date = '2026-11-19', placed_at = now()
         WHERE id = $1
         """,
+        # Placed, but with no promised pickup time.
+        """
+        UPDATE orders
+        SET status = 'placed', order_number = 1, business_date = '2026-11-19',
+            placed_at = now()
+        WHERE id = $1
+        """,
+        "UPDATE orders SET promised_pickup_at = now() WHERE id = $1",
     ):
         with pytest.raises(asyncpg.CheckViolationError):
             async with conn.transaction():
@@ -197,3 +210,34 @@ async def test_group_max_cannot_be_below_min(conn: asyncpg.Connection) -> None:
         await create_modifier_group(
             conn, restaurant_id, min_selections=2, max_selections=1
         )
+
+
+async def test_opening_hours_weekday_is_monday_to_sunday(
+    conn: asyncpg.Connection,
+) -> None:
+    restaurant_id = await create_restaurant(conn)
+
+    await create_hours(conn, restaurant_id, weekdays=[0, 6])
+
+    for bad in (-1, 7):
+        with pytest.raises(asyncpg.CheckViolationError):
+            async with conn.transaction():
+                await create_hours(conn, restaurant_id, weekdays=[bad])
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"kitchen_capacity": 0},
+        {"busy_extra_minutes": -1},
+        {"busy_extra_minutes": 121},
+        {"last_order_minutes": -1},
+    ],
+)
+async def test_settings_reject_impossible_kitchen_values(
+    conn: asyncpg.Connection, bad: dict
+) -> None:
+    restaurant_id = await create_restaurant(conn)
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await create_settings(conn, restaurant_id, **bad)

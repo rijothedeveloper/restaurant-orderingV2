@@ -12,6 +12,12 @@ INSERT INTO settings (restaurant_id, tax_rate_bps)
 VALUES ('00000000-0000-4000-8000-000000000001', 875)
 ON CONFLICT (restaurant_id) DO NOTHING;
 
+-- Placeholder hours: 07:00 to 23:00 every day (weekday 0 = Monday).
+INSERT INTO opening_hours (restaurant_id, weekday, opens_at, closes_at)
+SELECT '00000000-0000-4000-8000-000000000001', weekday, '07:00', '23:00'
+FROM generate_series(0, 6) AS weekday
+ON CONFLICT (restaurant_id, weekday, opens_at) DO NOTHING;
+
 INSERT INTO menu_categories (id, restaurant_id, name, sort_order)
 VALUES
     ('00000000-0000-4000-8000-000000010001', '00000000-0000-4000-8000-000000000001', 'Sandwiches', 10),

@@ -6,23 +6,39 @@ already has one open) and returns the order as it stands afterwards.
 
 Lines can change only while the order is a draft. `confirm_order` places it,
 and only at the revision the customer agreed to.
+
+Pickup times are quoted by `app.orders.pickup` from the opening hours, the
+kitchen's load and `clock.utcnow()`. A quote is an estimate until the order is
+placed; placing computes it once more and stores it as the promise.
 """
 
+from datetime import datetime
 from uuid import UUID
 
 import asyncpg
 
-from app.menu.models import MenuItem
+from app import clock
+from app.menu.models import Menu, MenuItem
 from app.menu.repository import fetch_menu
 from app.orders import repository
-from app.orders.errors import LinesUnavailable, OrderError
+from app.orders.errors import LinesUnavailable, OrderError, PickupUnavailable
 from app.orders.models import (
     AddLine,
     ChangeLine,
     Channel,
     CustomerDetails,
     Order,
+    OrderingStatus,
+    Pickup,
     ReadBack,
+    SetPickup,
+)
+from app.orders.pickup import (
+    PickupQuote,
+    PickupRules,
+    longest_prep_minutes,
+    quote_pickup,
+    wait_minutes,
 )
 from app.orders.pricing import (
     line_total_cents,
@@ -152,23 +168,51 @@ async def set_customer(
         return await get_order(conn, restaurant_id, order_id)
 
 
+async def set_pickup(
+    conn: asyncpg.Connection, restaurant_id: UUID, order_id: UUID, pickup: SetPickup
+) -> Pickup:
+    """Ask for a pickup time, or for as soon as possible, and quote it.
+
+    A new time bumps the revision, because the pickup time is part of what the
+    customer agrees to. Raises PickupUnavailable, leaving the draft as it was,
+    when no order can be taken now or the time cannot be met.
+    """
+    async with conn.transaction():
+        await _lock_draft(conn, restaurant_id, order_id)
+        order = await get_order(conn, restaurant_id, order_id)
+        menu = await fetch_menu(conn, restaurant_id)
+        quote = await _quote(conn, order, menu, pickup.requested_at)
+        await repository.update_requested_pickup(
+            conn, restaurant_id, order_id, pickup.requested_at
+        )
+        return Pickup(
+            order=await get_order(conn, restaurant_id, order_id),
+            ready_at=quote.ready_at,
+        )
+
+
 async def read_back(
     conn: asyncpg.Connection, restaurant_id: UUID, order_id: UUID
 ) -> ReadBack:
     """Build the read-back of the draft and record which revision was read.
 
-    Raises OrderError if the order is empty, or LinesUnavailable if a line can
-    no longer be made.
+    Raises OrderError if the order is empty, LinesUnavailable if a line can no
+    longer be made, or PickupUnavailable if it cannot be placed right now.
     """
     async with conn.transaction():
         await _lock_draft(conn, restaurant_id, order_id)
         order = await get_order(conn, restaurant_id, order_id)
-        await _check_lines(conn, order)
+        menu = await _check_lines(conn, order)
+        quote = await _quote(conn, order, menu, order.requested_pickup_at)
         await repository.set_read_back_revision(
             conn, restaurant_id, order_id, order.revision
         )
         order = order.model_copy(update={"read_back_revision": order.revision})
-        return ReadBack(order=order, text=read_back_text(order))
+        return ReadBack(
+            order=order,
+            text=read_back_text(order, quote.ready_at),
+            pickup_at=quote.ready_at,
+        )
 
 
 async def confirm_order(
@@ -182,8 +226,9 @@ async def confirm_order(
 
     `revision` is the revision the customer saw or heard; the order is placed
     only if nothing has changed since. `customer` sets the pickup name and
-    phone in the same step. Confirming an order that was already placed
-    returns it unchanged, so a repeated yes is harmless.
+    phone in the same step. The pickup time is quoted once more and stored as
+    the promise. Confirming an order that was already placed returns it
+    unchanged, so a repeated yes is harmless.
     """
     async with conn.transaction():
         locked = await repository.lock_order(conn, restaurant_id, order_id)
@@ -205,21 +250,74 @@ async def confirm_order(
                 conn, restaurant_id, order_id, customer.name, customer.phone
             )
         order = await get_order(conn, restaurant_id, order_id)
-        await _check_lines(conn, order)
+        menu = await _check_lines(conn, order)
         if not order.customer_name or not order.customer_phone:
             raise OrderError(
                 "customer_required", "A pickup name and phone number are needed"
             )
 
-        business_date = await repository.fetch_business_date(conn, restaurant_id)
-        number = await repository.next_order_number(conn, restaurant_id, business_date)
+        quote = await _quote(conn, order, menu, order.requested_pickup_at)
+        number = await repository.next_order_number(
+            conn, restaurant_id, quote.business_date
+        )
         await repository.mark_placed(
-            conn, restaurant_id, order_id, business_date, number
+            conn, restaurant_id, order_id, quote.business_date, number, quote.ready_at
         )
         await repository.insert_event(
             conn, restaurant_id, order_id, "draft", "placed", "customer"
         )
         return await get_order(conn, restaurant_id, order_id)
+
+
+async def ordering_status(
+    conn: asyncpg.Connection, restaurant_id: UUID
+) -> OrderingStatus:
+    """Whether an order could be placed right now, and the current wait."""
+    rules = await _pickup_rules(conn, restaurant_id)
+    open_orders = await repository.count_open_orders(conn, restaurant_id)
+    timezone = rules.timezone.key
+    try:
+        quote_pickup(rules, clock.utcnow(), None, 0, open_orders)
+    except PickupUnavailable as unavailable:
+        return OrderingStatus(
+            accepting=False,
+            reason=unavailable.code,
+            message=unavailable.message,
+            next_opening_at=unavailable.next_opening_at,
+            timezone=timezone,
+        )
+    return OrderingStatus(
+        accepting=True,
+        wait_minutes=wait_minutes(rules, open_orders),
+        timezone=timezone,
+    )
+
+
+async def _pickup_rules(conn: asyncpg.Connection, restaurant_id: UUID) -> PickupRules:
+    rules = await repository.fetch_pickup_rules(conn, restaurant_id)
+    if rules is None:
+        # Raises the error that says why: no such restaurant, or no settings.
+        await _tax_rate_bps(conn, restaurant_id)
+        raise OrderError("restaurant_not_found", "Restaurant not found")
+    return rules
+
+
+async def _quote(
+    conn: asyncpg.Connection,
+    order: Order,
+    menu: Menu | None,
+    requested_at: datetime | None,
+) -> PickupQuote:
+    """When `order` would be ready if it were placed now."""
+    rules = await _pickup_rules(conn, order.restaurant_id)
+    open_orders = await repository.count_open_orders(conn, order.restaurant_id)
+    return quote_pickup(
+        rules,
+        clock.utcnow(),
+        requested_at,
+        longest_prep_minutes(order, menu),
+        open_orders,
+    )
 
 
 async def _tax_rate_bps(conn: asyncpg.Connection, restaurant_id: UUID) -> int:
@@ -245,8 +343,11 @@ async def _lock_draft(
         raise OrderError("order_not_draft", "This order can no longer be changed")
 
 
-async def _check_lines(conn: asyncpg.Connection, order: Order) -> None:
-    """Reject an order with no lines, or with lines the menu no longer allows."""
+async def _check_lines(conn: asyncpg.Connection, order: Order) -> Menu:
+    """Reject an order with no lines, or with lines the menu no longer allows.
+
+    Returns the menu it checked against.
+    """
     if not order.lines:
         raise OrderError("order_empty", "The order has no items yet")
     menu = await fetch_menu(conn, order.restaurant_id)
@@ -255,6 +356,7 @@ async def _check_lines(conn: asyncpg.Connection, order: Order) -> None:
     lines = unavailable_lines(order, menu)
     if lines:
         raise LinesUnavailable(lines)
+    return menu
 
 
 async def _menu_item(

@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
@@ -12,7 +13,12 @@ from app.orders.pricing import (
     tax_cents,
     unavailable_lines,
 )
-from app.orders.readback import format_cents, read_back_text
+from app.orders.readback import (
+    confirmation_text,
+    format_cents,
+    format_time,
+    read_back_text,
+)
 
 
 def option(name: str, kind: str = "choice", delta: int = 0, available: bool = True):
@@ -215,6 +221,7 @@ def make_order(*lines: OrderLine) -> Order:
     return Order(
         id=uuid4(),
         restaurant_id=uuid4(),
+        timezone="America/Los_Angeles",
         status="draft",
         channel="web",
         revision=len(lines),
@@ -283,11 +290,44 @@ def test_read_back_text_lists_lines_options_notes_and_total() -> None:
     )
 
     # 2 x (1099 + 150) + 399 = 2897; tax 253.49 -> 253.
-    assert read_back_text(order) == (
+    # 02:40 UTC is 6:40 PM the evening before in Los Angeles.
+    pickup_at = datetime(2026, 11, 19, 2, 40, tzinfo=UTC)
+    assert read_back_text(order, pickup_at) == (
         "Your order: 2 x Chicken Sandwich (Grilled, Add bacon); "
         "1 x Fries (note: well done). "
-        "Total with tax: $31.50. Pay at pickup. Shall I place it?"
+        "Total with tax: $31.50. Ready for pickup about 6:40 PM. "
+        "Pay at pickup. Shall I place it?"
     )
+
+
+@pytest.mark.parametrize(
+    ("utc_hour", "minute", "expected"),
+    [(8, 0, "12:00 AM"), (17, 5, "9:05 AM"), (20, 0, "12:00 PM"), (2, 40, "6:40 PM")],
+)
+def test_format_time_is_local_twelve_hour(
+    utc_hour: int, minute: int, expected: str
+) -> None:
+    moment = datetime(2026, 11, 19, utc_hour, minute, tzinfo=UTC)
+
+    assert format_time(moment, "America/Los_Angeles") == expected
+
+
+def test_confirmation_text_gives_the_number_and_promised_time() -> None:
+    order = make_order(make_line(make_item()))
+    placed = order.model_copy(
+        update={
+            "status": "placed",
+            "order_number": 12,
+            "promised_pickup_at": datetime(2026, 11, 19, 2, 40, tzinfo=UTC),
+        }
+    )
+
+    assert confirmation_text(placed) == (
+        "Your order is placed. Your order number is 12. "
+        "It will be ready for pickup about 6:40 PM. Pay at pickup."
+    )
+    with pytest.raises(ValueError):
+        confirmation_text(order)
 
 
 # --- customer details -------------------------------------------------------

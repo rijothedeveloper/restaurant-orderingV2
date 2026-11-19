@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from app.menu.models import ModifierGroup
 from app.orders.models import OrderLine
 
@@ -33,3 +35,23 @@ class LinesUnavailable(OrderError):
             f"No longer available as ordered: {names}",
         )
         self.lines = lines
+
+
+class PickupUnavailable(OrderError):
+    """No order can be taken now, or the pickup time asked for cannot be met.
+
+    `next_opening_at` is when ordering opens again, and `earliest_at` the
+    earliest time the order could be ready; each is set only when it applies.
+    """
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        next_opening_at: datetime | None = None,
+        earliest_at: datetime | None = None,
+    ) -> None:
+        super().__init__(code, message)
+        self.next_opening_at = next_opening_at
+        self.earliest_at = earliest_at

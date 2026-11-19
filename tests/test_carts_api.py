@@ -1,11 +1,13 @@
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import timedelta
 from uuid import uuid4
 
 import asyncpg
 import pytest
 from httpx import AsyncClient
 
+from tests.conftest import NOON, FakeClock
 from tests.factories import Shop, create_shop
 
 pytestmark = pytest.mark.integration
@@ -207,6 +209,9 @@ async def test_checkout_places_the_cart(db_client: AsyncClient, shop: Shop) -> N
     assert order["customer_phone"] == "+14155552671"
     assert order["lines"] == cart["lines"]
     assert order["total_cents"] == cart["total_cents"] == 434
+    # Noon in Los Angeles plus 10 minutes of prep.
+    assert order["promised_pickup_at"] == "2026-11-18T20:10:00Z"
+    assert order["timezone"] == "America/Los_Angeles"
 
     # The placed order reads the same, a repeat changes nothing, and the next
     # cart takes the next number.
@@ -217,6 +222,93 @@ async def test_checkout_places_the_cart(db_client: AsyncClient, shop: Shop) -> N
     assert again.json() == order
     second = await checkout(db_client, shop, await cart_with_fries(db_client, shop))
     assert second.json()["order_number"] == 2
+
+
+async def test_pickup_time_can_be_set_and_is_promised_at_checkout(
+    db_client: AsyncClient, shop: Shop
+) -> None:
+    cart = await cart_with_fries(db_client, shop)
+    pickup_url = f"{carts_url(shop)}/{cart['id']}/pickup"
+
+    # As soon as possible: a quote, and the cart is unchanged.
+    response = await db_client.put(pickup_url, json={"requested_at": None})
+    assert response.status_code == 200
+    assert response.json() == {"order": cart, "ready_at": "2026-11-18T20:10:00Z"}
+
+    # 1 PM local time, sent with its offset.
+    response = await db_client.put(
+        pickup_url, json={"requested_at": "2026-11-18T13:00:00-08:00"}
+    )
+    assert response.status_code == 200
+    pickup = response.json()
+    assert pickup["ready_at"] == "2026-11-18T21:00:00Z"
+    assert pickup["order"]["requested_pickup_at"] == "2026-11-18T21:00:00Z"
+    assert pickup["order"]["revision"] == cart["revision"] + 1
+
+    # Too early: 409 with the earliest time, and the cart keeps 1 PM.
+    response = await db_client.put(
+        pickup_url, json={"requested_at": "2026-11-18T12:05:00-08:00"}
+    )
+    assert response.status_code == 409
+    body = response.json()
+    assert body["code"] == "pickup_too_early"
+    assert body["earliest_at"] == "2026-11-18T20:10:00Z"
+    assert body["next_opening_at"] is None
+
+    # A time needs its offset, and the key must be sent.
+    for bad in ({"requested_at": "2026-11-18T13:00:00"}, {}, {"requested_at": "soon"}):
+        assert (await db_client.put(pickup_url, json=bad)).status_code == 422, bad
+
+    # The cart the customer saw is the one with the pickup time.
+    stale = await checkout(db_client, shop, cart)
+    assert stale.json()["code"] == "order_changed"
+    placed = await checkout(db_client, shop, pickup["order"])
+    assert placed.status_code == 200
+    assert placed.json()["promised_pickup_at"] == "2026-11-18T21:00:00Z"
+
+
+async def test_checkout_while_closed_gives_the_next_opening(
+    db_client: AsyncClient, shop: Shop, clock: FakeClock
+) -> None:
+    cart = await cart_with_fries(db_client, shop)
+    clock.now = NOON + timedelta(hours=10)  # 10 PM; the shop closed at 9
+
+    response = await checkout(db_client, shop, cart)
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["code"] == "restaurant_closed"
+    assert body["next_opening_at"] == "2026-11-19T17:00:00Z"
+    assert body["earliest_at"] is None
+    stored = (await db_client.get(f"{carts_url(shop)}/{cart['id']}")).json()
+    assert stored["status"] == "draft"
+
+
+async def test_ordering_status(
+    db_client: AsyncClient, shop: Shop, clock: FakeClock
+) -> None:
+    url = f"/restaurants/{shop.restaurant_id}/ordering-status"
+
+    response = await db_client.get(url)
+    assert response.status_code == 200
+    assert response.json() == {
+        "accepting": True,
+        "reason": None,
+        "message": None,
+        "next_opening_at": None,
+        "wait_minutes": 0,
+        "timezone": "America/Los_Angeles",
+    }
+
+    clock.now = NOON + timedelta(hours=10)
+    closed = (await db_client.get(url)).json()
+    assert closed["accepting"] is False
+    assert closed["reason"] == "restaurant_closed"
+    assert closed["next_opening_at"] == "2026-11-19T17:00:00Z"
+
+    unknown = await db_client.get(f"/restaurants/{uuid4()}/ordering-status")
+    assert unknown.status_code == 404
+    assert unknown.json()["code"] == "restaurant_not_found"
 
 
 async def test_checkout_rejections(db_client: AsyncClient, shop: Shop) -> None:
