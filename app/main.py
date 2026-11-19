@@ -3,7 +3,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.carts import register_order_error_handler
+from app.api.carts import router as carts_router
 from app.api.health import router as health_router
+from app.api.menu import router as menu_router
 from app.config import Settings, get_settings
 from app.db import pool_lifespan
 
@@ -23,4 +26,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.db_pool = None
 
     app.include_router(health_router)
+    app.include_router(menu_router)
+    app.include_router(carts_router)
+    register_order_error_handler(app)
     return app
