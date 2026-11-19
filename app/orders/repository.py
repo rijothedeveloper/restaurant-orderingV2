@@ -1,12 +1,14 @@
 """SQL for orders. Every query is scoped by restaurant_id."""
 
-from datetime import date
+from datetime import date, datetime
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import asyncpg
 
 from app.menu.models import MenuItem
 from app.orders.models import Order, OrderLine, OrderLineModifier
+from app.orders.pickup import OpenWindow, PickupRules
 from app.orders.pricing import SelectedOption
 
 
@@ -274,10 +276,73 @@ async def set_read_back_revision(
     )
 
 
-async def fetch_business_date(conn: asyncpg.Connection, restaurant_id: UUID) -> date:
-    """Today's date in the restaurant's timezone."""
+async def update_requested_pickup(
+    conn: asyncpg.Connection,
+    restaurant_id: UUID,
+    order_id: UUID,
+    requested_at: datetime | None,
+) -> None:
+    """Store the pickup time asked for, bumping the revision if it changed."""
+    await conn.execute(
+        """
+        UPDATE orders
+        SET revision = revision
+                + (requested_pickup_at IS DISTINCT FROM $3::timestamptz)::int,
+            requested_pickup_at = $3, updated_at = now()
+        WHERE restaurant_id = $1 AND id = $2
+        """,
+        restaurant_id,
+        order_id,
+        requested_at,
+    )
+
+
+async def fetch_pickup_rules(
+    conn: asyncpg.Connection, restaurant_id: UUID
+) -> PickupRules | None:
+    """Opening hours and kitchen settings; None without a settings row."""
+    row = await conn.fetchrow(
+        """
+        SELECT r.timezone, s.kitchen_capacity, s.busy_extra_minutes,
+               s.last_order_minutes, s.accepting_orders
+        FROM restaurants AS r
+        JOIN settings AS s ON s.restaurant_id = r.id
+        WHERE r.id = $1
+        """,
+        restaurant_id,
+    )
+    if row is None:
+        return None
+    hours = await conn.fetch(
+        """
+        SELECT weekday, opens_at, closes_at
+        FROM opening_hours
+        WHERE restaurant_id = $1
+        ORDER BY weekday, opens_at
+        """,
+        restaurant_id,
+    )
+    return PickupRules(
+        timezone=ZoneInfo(row["timezone"]),
+        windows=[
+            OpenWindow(hour["weekday"], hour["opens_at"], hour["closes_at"])
+            for hour in hours
+        ],
+        kitchen_capacity=row["kitchen_capacity"],
+        busy_extra_minutes=row["busy_extra_minutes"],
+        last_order_minutes=row["last_order_minutes"],
+        accepting_orders=row["accepting_orders"],
+    )
+
+
+async def count_open_orders(conn: asyncpg.Connection, restaurant_id: UUID) -> int:
+    """Placed orders the kitchen has not finished yet."""
     return await conn.fetchval(
-        "SELECT (now() AT TIME ZONE timezone)::date FROM restaurants WHERE id = $1",
+        """
+        SELECT count(*)
+        FROM orders
+        WHERE restaurant_id = $1 AND status IN ('placed', 'accepted', 'preparing')
+        """,
         restaurant_id,
     )
 
@@ -309,18 +374,20 @@ async def mark_placed(
     order_id: UUID,
     business_date: date,
     order_number: int,
+    promised_pickup_at: datetime,
 ) -> None:
     await conn.execute(
         """
         UPDATE orders
         SET status = 'placed', business_date = $3, order_number = $4,
-            placed_at = now(), updated_at = now()
+            promised_pickup_at = $5, placed_at = now(), updated_at = now()
         WHERE restaurant_id = $1 AND id = $2
         """,
         restaurant_id,
         order_id,
         business_date,
         order_number,
+        promised_pickup_at,
     )
 
 
@@ -351,11 +418,14 @@ async def fetch_order(
 ) -> Order | None:
     order = await conn.fetchrow(
         """
-        SELECT id, restaurant_id, status, channel, revision, read_back_revision,
-               order_number, placed_at, customer_name, customer_phone,
-               subtotal_cents, tax_rate_bps, tax_cents, total_cents
-        FROM orders
-        WHERE restaurant_id = $1 AND id = $2
+        SELECT o.id, o.restaurant_id, r.timezone, o.status, o.channel, o.revision,
+               o.read_back_revision, o.order_number, o.placed_at,
+               o.requested_pickup_at, o.promised_pickup_at,
+               o.customer_name, o.customer_phone,
+               o.subtotal_cents, o.tax_rate_bps, o.tax_cents, o.total_cents
+        FROM orders AS o
+        JOIN restaurants AS r ON r.id = o.restaurant_id
+        WHERE o.restaurant_id = $1 AND o.id = $2
         """,
         restaurant_id,
         order_id,
@@ -403,12 +473,15 @@ async def fetch_order(
     return Order(
         id=order["id"],
         restaurant_id=order["restaurant_id"],
+        timezone=order["timezone"],
         status=order["status"],
         channel=order["channel"],
         revision=order["revision"],
         read_back_revision=order["read_back_revision"],
         order_number=order["order_number"],
         placed_at=order["placed_at"],
+        requested_pickup_at=order["requested_pickup_at"],
+        promised_pickup_at=order["promised_pickup_at"],
         customer_name=order["customer_name"],
         customer_phone=order["customer_phone"],
         subtotal_cents=order["subtotal_cents"],

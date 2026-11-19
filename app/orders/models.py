@@ -2,7 +2,14 @@ from datetime import datetime
 from typing import Literal, Self
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from app.orders.phone import normalize_phone
 
@@ -51,6 +58,8 @@ class OrderLine(BaseModel):
 class Order(BaseModel):
     id: UUID
     restaurant_id: UUID
+    # The restaurant's IANA timezone, for showing and speaking times.
+    timezone: str
     status: OrderStatus
     channel: Channel
     # Bumped by every change to the lines; pickup name and phone do not count.
@@ -60,6 +69,10 @@ class Order(BaseModel):
     # Set when the order is placed; the number counts per restaurant per day.
     order_number: int | None = None
     placed_at: datetime | None = None
+    # The pickup time the customer asked for; None means as soon as possible.
+    requested_pickup_at: datetime | None = None
+    # The pickup time promised when the order was placed.
+    promised_pickup_at: datetime | None = None
     customer_name: str | None = None
     customer_phone: str | None = None
     lines: list[OrderLine] = Field(default_factory=list)
@@ -74,6 +87,37 @@ class ReadBack(BaseModel):
 
     order: Order
     text: str
+    # When the order would be ready if it were placed now.
+    pickup_at: datetime
+
+
+class Pickup(BaseModel):
+    """The order after its pickup time was set, and when it would be ready."""
+
+    order: Order
+    # An estimate until the order is placed; placing fixes the promise.
+    ready_at: datetime
+
+
+class OrderingStatus(BaseModel):
+    """Whether the restaurant can take an order right now."""
+
+    accepting: bool
+    # Why not, as an error code and its message; None while accepting.
+    reason: str | None = None
+    message: str | None = None
+    next_opening_at: datetime | None = None
+    # Queue delay plus busy-mode extra, before the items' own prep time.
+    wait_minutes: int | None = None
+    timezone: str
+
+
+class SetPickup(BaseModel):
+    """The pickup time the customer wants; null means as soon as possible."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    requested_at: AwareDatetime | None
 
 
 class CustomerDetails(BaseModel):

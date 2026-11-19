@@ -4,18 +4,31 @@ The cart id is the order's random UUID and is the only handle on the cart.
 There is no auth, rate limiting or bot protection yet; add them before launch.
 """
 
+from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
 import asyncpg
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from app.db import get_pool
 from app.orders import service
-from app.orders.errors import LinesUnavailable, MissingRequiredChoices, OrderError
-from app.orders.models import AddLine, ChangeLine, CustomerDetails, Order
+from app.orders.errors import (
+    LinesUnavailable,
+    MissingRequiredChoices,
+    OrderError,
+    PickupUnavailable,
+)
+from app.orders.models import (
+    AddLine,
+    ChangeLine,
+    CustomerDetails,
+    Order,
+    Pickup,
+    SetPickup,
+)
 
 router = APIRouter(prefix="/restaurants/{restaurant_id}/carts", tags=["carts"])
 
@@ -32,6 +45,11 @@ ERROR_STATUS = {
     "order_empty": 409,
     "customer_required": 409,
     "lines_unavailable": 409,
+    "ordering_paused": 409,
+    "restaurant_closed": 409,
+    "past_last_order": 409,
+    "pickup_too_early": 409,
+    "pickup_too_late": 409,
 }
 
 
@@ -41,12 +59,24 @@ class Checkout(CustomerDetails):
     revision: int = Field(ge=0)
 
 
+class PickupTimes(BaseModel):
+    """The times a PickupUnavailable error carries, written as the API writes them."""
+
+    next_opening_at: datetime | None
+    earliest_at: datetime | None
+
+
 async def order_error_handler(request: Request, exc: OrderError) -> JSONResponse:
     body: dict = {"code": exc.code, "message": exc.message}
     if isinstance(exc, MissingRequiredChoices):
         body["missing_groups"] = [group.model_dump(mode="json") for group in exc.groups]
     if isinstance(exc, LinesUnavailable):
         body["lines"] = [line.model_dump(mode="json") for line in exc.lines]
+    if isinstance(exc, PickupUnavailable):
+        times = PickupTimes(
+            next_opening_at=exc.next_opening_at, earliest_at=exc.earliest_at
+        )
+        body.update(times.model_dump(mode="json"))
     return JSONResponse(status_code=ERROR_STATUS.get(exc.code, 422), content=body)
 
 
@@ -90,12 +120,26 @@ async def remove_line(
         return await service.remove_item(conn, restaurant_id, cart_id, line_id)
 
 
+@router.put("/{cart_id}/pickup")
+async def set_pickup(
+    restaurant_id: UUID, cart_id: UUID, pickup: SetPickup, pool: Pool
+) -> Pickup:
+    """Ask for a pickup time (`requested_at` null for as soon as possible).
+
+    Returns the cart and when it would be ready. 409 with `earliest_at` or
+    `next_opening_at` when the time cannot be met or ordering is closed.
+    """
+    async with pool.acquire() as conn:
+        return await service.set_pickup(conn, restaurant_id, cart_id, pickup)
+
+
 @router.post("/{cart_id}/checkout")
 async def checkout(
     restaurant_id: UUID, cart_id: UUID, body: Checkout, pool: Pool
 ) -> Order:
     """Place the cart as an order. 409 `order_changed` if the cart is newer than
-    the revision sent; repeating a checkout returns the placed order again."""
+    the revision sent; repeating a checkout returns the placed order again.
+    The placed order carries `promised_pickup_at`."""
     async with pool.acquire() as conn:
         return await service.confirm_order(
             conn, restaurant_id, cart_id, body.revision, customer=body

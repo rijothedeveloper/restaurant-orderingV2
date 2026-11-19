@@ -1,6 +1,8 @@
 """Insert helpers for integration tests. Each returns the new row's id."""
 
+from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import time
 from uuid import UUID
 
 import asyncpg
@@ -16,12 +18,45 @@ async def create_restaurant(conn: asyncpg.Connection, name: str = "Test Diner") 
 
 
 async def create_settings(
-    conn: asyncpg.Connection, restaurant_id: UUID, tax_rate_bps: int = 875
+    conn: asyncpg.Connection,
+    restaurant_id: UUID,
+    tax_rate_bps: int = 875,
+    *,
+    kitchen_capacity: int = 3,
+    busy_extra_minutes: int = 0,
+    last_order_minutes: int = 15,
+    accepting_orders: bool = True,
 ) -> None:
     await conn.execute(
-        "INSERT INTO settings (restaurant_id, tax_rate_bps) VALUES ($1, $2)",
+        """
+        INSERT INTO settings (restaurant_id, tax_rate_bps, kitchen_capacity,
+                              busy_extra_minutes, last_order_minutes,
+                              accepting_orders)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        """,
         restaurant_id,
         tax_rate_bps,
+        kitchen_capacity,
+        busy_extra_minutes,
+        last_order_minutes,
+        accepting_orders,
+    )
+
+
+async def create_hours(
+    conn: asyncpg.Connection,
+    restaurant_id: UUID,
+    opens_at: time = time(9),
+    closes_at: time = time(21),
+    weekdays: Iterable[int] = range(7),
+) -> None:
+    """Open the restaurant from opens_at to closes_at on each of weekdays."""
+    await conn.executemany(
+        """
+        INSERT INTO opening_hours (restaurant_id, weekday, opens_at, closes_at)
+        VALUES ($1, $2, $3, $4)
+        """,
+        [(restaurant_id, weekday, opens_at, closes_at) for weekday in weekdays],
     )
 
 
@@ -186,7 +221,10 @@ async def create_order_item(
 
 @dataclass
 class Shop:
-    """A restaurant with settings and a small menu, for order tests."""
+    """A restaurant with settings, hours and a small menu, for order tests.
+
+    Open 09:00 to 21:00 every day; every item takes 10 minutes to prepare.
+    """
 
     restaurant_id: UUID
     sandwich: UUID  # 1099; Style (required, pick 1) and Extras (optional, up to 2)
@@ -203,6 +241,7 @@ class Shop:
 async def create_shop(conn: asyncpg.Connection, name: str = "Test Diner") -> Shop:
     restaurant_id = await create_restaurant(conn, name)
     await create_settings(conn, restaurant_id, tax_rate_bps=875)
+    await create_hours(conn, restaurant_id)
     mains = await create_category(conn, restaurant_id, "Mains")
 
     sandwich = await create_menu_item(

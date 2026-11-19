@@ -1,5 +1,6 @@
 import os
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 
 import asyncpg
 import pytest
@@ -9,6 +10,25 @@ from pydantic import SecretStr
 
 from app.config import Settings
 from app.main import create_app
+
+# A Wednesday, noon in America/Los_Angeles (the default restaurants.timezone).
+NOON = datetime(2026, 11, 18, 20, 0, tzinfo=UTC)
+
+
+class FakeClock:
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+@pytest.fixture(autouse=True)
+def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    """Fixes the order engine's clock at NOON; set `clock.now` to move it."""
+    fake = FakeClock(NOON)
+    monkeypatch.setattr("app.clock.utcnow", fake)
+    return fake
 
 
 @pytest.fixture
