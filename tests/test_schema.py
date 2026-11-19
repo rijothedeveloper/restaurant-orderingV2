@@ -31,6 +31,8 @@ async def test_tables_exist(conn: asyncpg.Connection) -> None:
         "orders",
         "order_items",
         "order_item_modifiers",
+        "order_counters",
+        "order_events",
     } <= tables
 
 
@@ -62,7 +64,70 @@ async def test_new_order_defaults_to_draft_without_a_number(
 
     assert row["status"] == "draft"
     assert row["revision"] == 0
-    assert "order_number" not in row.keys()
+    assert row["order_number"] is None
+    assert row["business_date"] is None
+    assert row["placed_at"] is None
+
+
+PLACE = """
+    UPDATE orders
+    SET status = 'placed', order_number = $2, business_date = '2026-11-19',
+        placed_at = now()
+    WHERE id = $1
+"""
+
+
+async def test_only_a_placed_order_has_a_number(conn: asyncpg.Connection) -> None:
+    restaurant_id = await create_restaurant(conn)
+    order_id = await create_order(conn, restaurant_id)
+
+    for bad in (
+        "UPDATE orders SET status = 'placed' WHERE id = $1",
+        "UPDATE orders SET status = 'ready' WHERE id = $1",
+        "UPDATE orders SET order_number = 1 WHERE id = $1",
+        """
+        UPDATE orders
+        SET order_number = 1, business_date = '2026-11-19', placed_at = now()
+        WHERE id = $1
+        """,
+    ):
+        with pytest.raises(asyncpg.CheckViolationError):
+            async with conn.transaction():
+                await conn.execute(bad, order_id)
+
+    await conn.execute(PLACE, order_id, 1)
+    await conn.execute("UPDATE orders SET status = 'cancelled' WHERE id = $1", order_id)
+
+
+async def test_order_number_is_unique_per_restaurant_and_date(
+    conn: asyncpg.Connection,
+) -> None:
+    restaurant_id = await create_restaurant(conn)
+    other_restaurant_id = await create_restaurant(conn, "Other Diner")
+    first = await create_order(conn, restaurant_id)
+    second = await create_order(conn, restaurant_id)
+    elsewhere = await create_order(conn, other_restaurant_id)
+
+    await conn.execute(PLACE, first, 1)
+    await conn.execute(PLACE, elsewhere, 1)
+
+    with pytest.raises(asyncpg.UniqueViolationError):
+        async with conn.transaction():
+            await conn.execute(PLACE, second, 1)
+    await conn.execute(PLACE, second, 2)
+
+
+async def test_customer_phone_must_be_e164(conn: asyncpg.Connection) -> None:
+    restaurant_id = await create_restaurant(conn)
+    order_id = await create_order(conn, restaurant_id)
+    update = "UPDATE orders SET customer_phone = $2 WHERE id = $1"
+
+    await conn.execute(update, order_id, "+14155552671")
+
+    for bad in ("4155552671", "+1 415 555 2671", "+0155552671", ""):
+        with pytest.raises(asyncpg.CheckViolationError):
+            async with conn.transaction():
+                await conn.execute(update, order_id, bad)
 
 
 async def test_valid_order_item_inserts(conn: asyncpg.Connection) -> None:

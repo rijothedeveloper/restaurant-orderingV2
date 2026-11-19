@@ -1,11 +1,15 @@
+from datetime import datetime
 from typing import Literal, Self
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.orders.phone import normalize_phone
+
 # Sanity bound on one line, not a business rule; order caps come from settings later.
 MAX_LINE_QUANTITY = 99
 MAX_NOTES_LENGTH = 200
+MAX_NAME_LENGTH = 80
 
 Channel = Literal["voice", "web", "whatsapp", "sms", "storefront"]
 OrderStatus = Literal[
@@ -49,12 +53,38 @@ class Order(BaseModel):
     restaurant_id: UUID
     status: OrderStatus
     channel: Channel
+    # Bumped by every change to the lines; pickup name and phone do not count.
     revision: int
+    # The revision last read back to the customer, if any.
+    read_back_revision: int | None = None
+    # Set when the order is placed; the number counts per restaurant per day.
+    order_number: int | None = None
+    placed_at: datetime | None = None
+    customer_name: str | None = None
+    customer_phone: str | None = None
     lines: list[OrderLine] = Field(default_factory=list)
     subtotal_cents: int
     tax_rate_bps: int
     tax_cents: int
     total_cents: int
+
+
+class ReadBack(BaseModel):
+    """The order as read to the customer, and the words to say."""
+
+    order: Order
+    text: str
+
+
+class CustomerDetails(BaseModel):
+    """Who picks the order up. The phone is stored in E.164 form."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
+    phone: str = Field(min_length=1, max_length=32)
+
+    _normalize = field_validator("phone")(normalize_phone)
 
 
 def _clean_notes(value: str | None) -> str | None:

@@ -1,5 +1,6 @@
 """SQL for orders. Every query is scoped by restaurant_id."""
 
+from datetime import date
 from uuid import UUID
 
 import asyncpg
@@ -40,12 +41,20 @@ async def insert_draft(
     )
 
 
-async def lock_order_status(
+async def lock_order(
     conn: asyncpg.Connection, restaurant_id: UUID, order_id: UUID
-) -> str | None:
-    """Lock the order row until the transaction ends and return its status."""
-    return await conn.fetchval(
-        "SELECT status FROM orders WHERE restaurant_id = $1 AND id = $2 FOR UPDATE",
+) -> asyncpg.Record | None:
+    """Lock the order row until the transaction ends.
+
+    Returns its status, revision and order_number.
+    """
+    return await conn.fetchrow(
+        """
+        SELECT status, revision, order_number
+        FROM orders
+        WHERE restaurant_id = $1 AND id = $2
+        FOR UPDATE
+        """,
         restaurant_id,
         order_id,
     )
@@ -230,13 +239,121 @@ async def update_totals(
     )
 
 
+async def update_customer(
+    conn: asyncpg.Connection,
+    restaurant_id: UUID,
+    order_id: UUID,
+    name: str,
+    phone: str,
+) -> None:
+    await conn.execute(
+        """
+        UPDATE orders
+        SET customer_name = $3, customer_phone = $4, updated_at = now()
+        WHERE restaurant_id = $1 AND id = $2
+        """,
+        restaurant_id,
+        order_id,
+        name,
+        phone,
+    )
+
+
+async def set_read_back_revision(
+    conn: asyncpg.Connection, restaurant_id: UUID, order_id: UUID, revision: int
+) -> None:
+    await conn.execute(
+        """
+        UPDATE orders
+        SET read_back_revision = $3, updated_at = now()
+        WHERE restaurant_id = $1 AND id = $2
+        """,
+        restaurant_id,
+        order_id,
+        revision,
+    )
+
+
+async def fetch_business_date(conn: asyncpg.Connection, restaurant_id: UUID) -> date:
+    """Today's date in the restaurant's timezone."""
+    return await conn.fetchval(
+        "SELECT (now() AT TIME ZONE timezone)::date FROM restaurants WHERE id = $1",
+        restaurant_id,
+    )
+
+
+async def next_order_number(
+    conn: asyncpg.Connection, restaurant_id: UUID, business_date: date
+) -> int:
+    """Take the next order number for the day, starting at 1.
+
+    The counter row stays locked until the transaction ends, so numbers are
+    handed out one placement at a time and a rollback leaves no gap.
+    """
+    return await conn.fetchval(
+        """
+        INSERT INTO order_counters (restaurant_id, business_date, last_number)
+        VALUES ($1, $2, 1)
+        ON CONFLICT (restaurant_id, business_date)
+        DO UPDATE SET last_number = order_counters.last_number + 1
+        RETURNING last_number
+        """,
+        restaurant_id,
+        business_date,
+    )
+
+
+async def mark_placed(
+    conn: asyncpg.Connection,
+    restaurant_id: UUID,
+    order_id: UUID,
+    business_date: date,
+    order_number: int,
+) -> None:
+    await conn.execute(
+        """
+        UPDATE orders
+        SET status = 'placed', business_date = $3, order_number = $4,
+            placed_at = now(), updated_at = now()
+        WHERE restaurant_id = $1 AND id = $2
+        """,
+        restaurant_id,
+        order_id,
+        business_date,
+        order_number,
+    )
+
+
+async def insert_event(
+    conn: asyncpg.Connection,
+    restaurant_id: UUID,
+    order_id: UUID,
+    from_status: str,
+    to_status: str,
+    actor_type: str,
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO order_events (restaurant_id, order_id, from_status, to_status,
+                                  actor_type)
+        VALUES ($1, $2, $3, $4, $5)
+        """,
+        restaurant_id,
+        order_id,
+        from_status,
+        to_status,
+        actor_type,
+    )
+
+
 async def fetch_order(
     conn: asyncpg.Connection, restaurant_id: UUID, order_id: UUID
 ) -> Order | None:
     order = await conn.fetchrow(
         """
-        SELECT id, restaurant_id, status, channel, revision, subtotal_cents,
-               tax_rate_bps, tax_cents, total_cents
+        SELECT id, restaurant_id, status, channel, revision, read_back_revision,
+               order_number, placed_at, customer_name, customer_phone,
+               subtotal_cents, tax_rate_bps, tax_cents, total_cents
         FROM orders
         WHERE restaurant_id = $1 AND id = $2
         """,
@@ -289,6 +406,11 @@ async def fetch_order(
         status=order["status"],
         channel=order["channel"],
         revision=order["revision"],
+        read_back_revision=order["read_back_revision"],
+        order_number=order["order_number"],
+        placed_at=order["placed_at"],
+        customer_name=order["customer_name"],
+        customer_phone=order["customer_phone"],
         subtotal_cents=order["subtotal_cents"],
         tax_rate_bps=order["tax_rate_bps"],
         tax_cents=order["tax_cents"],

@@ -4,8 +4,9 @@ from collections import Counter
 from collections.abc import Sequence
 from uuid import UUID
 
-from app.menu.models import MenuItem, ModifierGroup, ModifierOption
+from app.menu.models import Menu, MenuItem, ModifierGroup, ModifierOption
 from app.orders.errors import MissingRequiredChoices, OrderError
+from app.orders.models import Order, OrderLine
 
 SelectedOption = tuple[ModifierGroup, ModifierOption]
 
@@ -75,3 +76,21 @@ def select_options(item: MenuItem, option_ids: Sequence[UUID]) -> list[SelectedO
         for option in group.options
         if option.id in chosen
     ]
+
+
+def unavailable_lines(order: Order, menu: Menu) -> list[OrderLine]:
+    """Lines the current menu no longer allows as they were ordered.
+
+    A line fails when its item or a chosen option is sold out or gone, or when
+    its options no longer satisfy the item's modifier groups.
+    """
+    failed = []
+    for line in order.lines:
+        item = menu.find_item(line.menu_item_id)
+        try:
+            if item is None:
+                raise OrderError("item_not_found", "That item is not on the menu")
+            select_options(item, [modifier.option_id for modifier in line.modifiers])
+        except OrderError:
+            failed.append(line)
+    return failed

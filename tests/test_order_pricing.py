@@ -2,9 +2,17 @@ from uuid import uuid4
 
 import pytest
 
-from app.menu.models import MenuItem, ModifierGroup, ModifierOption
+from app.menu.models import Menu, MenuCategory, MenuItem, ModifierGroup, ModifierOption
 from app.orders.errors import MissingRequiredChoices, OrderError
-from app.orders.pricing import line_total_cents, select_options, tax_cents
+from app.orders.models import CustomerDetails, Order, OrderLine, OrderLineModifier
+from app.orders.phone import normalize_phone
+from app.orders.pricing import (
+    line_total_cents,
+    select_options,
+    tax_cents,
+    unavailable_lines,
+)
+from app.orders.readback import format_cents, read_back_text
 
 
 def option(name: str, kind: str = "choice", delta: int = 0, available: bool = True):
@@ -162,3 +170,173 @@ def test_select_options_too_many_in_required_group() -> None:
         select_options(make_item(style), [o.id for o in style.options])
 
     assert error.value.code == "too_many_selections"
+
+
+# --- unavailable_lines ------------------------------------------------------
+
+
+def make_menu(*items: MenuItem) -> Menu:
+    return Menu(
+        restaurant_id=uuid4(),
+        restaurant_name="Test Diner",
+        categories=[MenuCategory(id=uuid4(), name="Mains", items=list(items))],
+    )
+
+
+def make_line(
+    item: MenuItem, *options: ModifierOption, quantity: int = 1, notes=None
+) -> OrderLine:
+    modifier_total = sum(o.price_delta_cents for o in options)
+    return OrderLine(
+        id=uuid4(),
+        menu_item_id=item.id,
+        name=item.name,
+        quantity=quantity,
+        unit_price_cents=item.price_cents,
+        modifier_total_cents=modifier_total,
+        line_total_cents=(item.price_cents + modifier_total) * quantity,
+        notes=notes,
+        modifiers=[
+            OrderLineModifier(
+                option_id=o.id,
+                group_name="Group",
+                name=o.name,
+                kind=o.kind,
+                price_delta_cents=o.price_delta_cents,
+            )
+            for o in options
+        ],
+    )
+
+
+def make_order(*lines: OrderLine) -> Order:
+    subtotal = sum(line.line_total_cents for line in lines)
+    tax = tax_cents(subtotal, 875)
+    return Order(
+        id=uuid4(),
+        restaurant_id=uuid4(),
+        status="draft",
+        channel="web",
+        revision=len(lines),
+        lines=list(lines),
+        subtotal_cents=subtotal,
+        tax_rate_bps=875,
+        tax_cents=tax,
+        total_cents=subtotal + tax,
+    )
+
+
+def test_unavailable_lines_is_empty_when_everything_can_be_made() -> None:
+    style, extras = style_group(), extras_group()
+    item = make_item(style, extras)
+    order = make_order(make_line(item, style.options[0], extras.options[0]))
+
+    assert unavailable_lines(order, make_menu(item)) == []
+
+
+def test_unavailable_lines_finds_sold_out_and_missing_items() -> None:
+    fine = make_item()
+    sold_out = make_item(available=False)
+    gone = make_item()
+    lines = [make_line(fine), make_line(sold_out), make_line(gone)]
+
+    failed = unavailable_lines(make_order(*lines), make_menu(fine, sold_out))
+
+    assert failed == lines[1:]
+
+
+def test_unavailable_lines_finds_a_sold_out_option() -> None:
+    extras = extras_group()
+    item = make_item(extras)
+    line = make_line(item, extras.options[0])
+    extras.options[0].is_available = False
+
+    assert unavailable_lines(make_order(line), make_menu(item)) == [line]
+
+
+def test_unavailable_lines_finds_a_newly_required_choice() -> None:
+    plain = make_item()
+    line = make_line(plain)
+    now_with_style = plain.model_copy(update={"modifier_groups": [style_group()]})
+
+    assert unavailable_lines(make_order(line), make_menu(now_with_style)) == [line]
+
+
+# --- read-back --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("cents", "expected"),
+    [(0, "$0.00"), (5, "$0.05"), (399, "$3.99"), (120000, "$1200.00")],
+)
+def test_format_cents(cents: int, expected: str) -> None:
+    assert format_cents(cents) == expected
+
+
+def test_read_back_text_lists_lines_options_notes_and_total() -> None:
+    style, extras = style_group(), extras_group()
+    sandwich = make_item(style, extras)
+    fries = make_item().model_copy(update={"name": "Fries", "price_cents": 399})
+    order = make_order(
+        make_line(sandwich, style.options[0], extras.options[0], quantity=2),
+        make_line(fries, notes="well done"),
+    )
+
+    # 2 x (1099 + 150) + 399 = 2897; tax 253.49 -> 253.
+    assert read_back_text(order) == (
+        "Your order: 2 x Chicken Sandwich (Grilled, Add bacon); "
+        "1 x Fries (note: well done). "
+        "Total with tax: $31.50. Pay at pickup. Shall I place it?"
+    )
+
+
+# --- customer details -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("4155552671", "+14155552671"),
+        ("(415) 555-2671", "+14155552671"),
+        ("415.555.2671", "+14155552671"),
+        ("1 415 555 2671", "+14155552671"),
+        ("+1 415-555-2671", "+14155552671"),
+        ("+44 20 7946 0958", "+442079460958"),
+    ],
+)
+def test_normalize_phone(raw: str, expected: str) -> None:
+    assert normalize_phone(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "555-2671",
+        "0155552671",
+        "415555267",
+        "41555526711",
+        "+0123456789",
+        "+1234567",
+        "call me",
+        "４１５５５５２６７１",
+    ],
+)
+def test_normalize_phone_rejects(raw: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_phone(raw)
+
+
+def test_customer_details_are_cleaned() -> None:
+    customer = CustomerDetails(name="  Sam  ", phone=" (415) 555-2671 ")
+
+    assert customer.name == "Sam"
+    assert customer.phone == "+14155552671"
+    for bad in (
+        {"name": "   ", "phone": "4155552671"},
+        {"name": "x" * 81, "phone": "4155552671"},
+        {"name": "Sam", "phone": "nope"},
+        {"name": "Sam", "phone": "4155552671", "extra": 1},
+    ):
+        with pytest.raises(ValueError):
+            CustomerDetails(**bad)

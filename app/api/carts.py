@@ -10,11 +10,12 @@ from uuid import UUID
 import asyncpg
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
+from pydantic import Field
 
 from app.db import get_pool
 from app.orders import service
-from app.orders.errors import MissingRequiredChoices, OrderError
-from app.orders.models import AddLine, ChangeLine, Order
+from app.orders.errors import LinesUnavailable, MissingRequiredChoices, OrderError
+from app.orders.models import AddLine, ChangeLine, CustomerDetails, Order
 
 router = APIRouter(prefix="/restaurants/{restaurant_id}/carts", tags=["carts"])
 
@@ -27,13 +28,25 @@ ERROR_STATUS = {
     "line_not_found": 404,
     "order_not_draft": 409,
     "restaurant_not_configured": 409,
+    "order_changed": 409,
+    "order_empty": 409,
+    "customer_required": 409,
+    "lines_unavailable": 409,
 }
+
+
+class Checkout(CustomerDetails):
+    """Who picks the order up, and the revision of the cart they agreed to."""
+
+    revision: int = Field(ge=0)
 
 
 async def order_error_handler(request: Request, exc: OrderError) -> JSONResponse:
     body: dict = {"code": exc.code, "message": exc.message}
     if isinstance(exc, MissingRequiredChoices):
         body["missing_groups"] = [group.model_dump(mode="json") for group in exc.groups]
+    if isinstance(exc, LinesUnavailable):
+        body["lines"] = [line.model_dump(mode="json") for line in exc.lines]
     return JSONResponse(status_code=ERROR_STATUS.get(exc.code, 422), content=body)
 
 
@@ -75,3 +88,15 @@ async def remove_line(
 ) -> Order:
     async with pool.acquire() as conn:
         return await service.remove_item(conn, restaurant_id, cart_id, line_id)
+
+
+@router.post("/{cart_id}/checkout")
+async def checkout(
+    restaurant_id: UUID, cart_id: UUID, body: Checkout, pool: Pool
+) -> Order:
+    """Place the cart as an order. 409 `order_changed` if the cart is newer than
+    the revision sent; repeating a checkout returns the placed order again."""
+    async with pool.acquire() as conn:
+        return await service.confirm_order(
+            conn, restaurant_id, cart_id, body.revision, customer=body
+        )

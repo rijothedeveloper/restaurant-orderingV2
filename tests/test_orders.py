@@ -1,12 +1,19 @@
+from datetime import date
 from uuid import uuid4
 
 import asyncpg
 import pytest
 
-from app.orders import service
-from app.orders.errors import MissingRequiredChoices, OrderError
-from app.orders.models import AddLine, ChangeLine, Order
-from tests.factories import Shop, create_restaurant, create_shop
+from app.orders import repository, service
+from app.orders.errors import LinesUnavailable, MissingRequiredChoices, OrderError
+from app.orders.models import AddLine, ChangeLine, CustomerDetails, Order
+from tests.factories import (
+    CUSTOMER,
+    Shop,
+    create_restaurant,
+    create_shop,
+    place_order,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -401,8 +408,8 @@ async def test_only_drafts_can_change(
 ) -> None:
     order = await add(conn, shop, draft, shop.fries)
     line_id = order.lines[0].id
-    await conn.execute("UPDATE orders SET status = 'placed' WHERE id = $1", draft.id)
     restaurant_id = shop.restaurant_id
+    await place_order(conn, restaurant_id, draft.id)
 
     for attempt in (
         add(conn, shop, draft, shop.fries),
@@ -410,6 +417,8 @@ async def test_only_drafts_can_change(
             conn, restaurant_id, draft.id, line_id, ChangeLine(quantity=2)
         ),
         service.remove_item(conn, restaurant_id, draft.id, line_id),
+        service.set_customer(conn, restaurant_id, draft.id, CUSTOMER),
+        service.read_back(conn, restaurant_id, draft.id),
     ):
         with pytest.raises(OrderError) as error:
             await attempt
@@ -436,10 +445,328 @@ async def test_order_is_invisible_to_another_restaurant(
             conn, other.restaurant_id, draft.id, line_id, ChangeLine(quantity=2)
         ),
         service.remove_item(conn, other.restaurant_id, draft.id, line_id),
+        service.set_customer(conn, other.restaurant_id, draft.id, CUSTOMER),
+        service.read_back(conn, other.restaurant_id, draft.id),
+        service.confirm_order(conn, other.restaurant_id, draft.id, 1, CUSTOMER),
     ):
         with pytest.raises(OrderError) as error:
             await attempt
         assert error.value.code == "order_not_found"
+
+
+# --- set_customer -----------------------------------------------------------
+
+
+async def test_set_customer_stores_details_and_keeps_the_revision(
+    conn: asyncpg.Connection, shop: Shop, draft: Order
+) -> None:
+    await add(conn, shop, draft, shop.fries)
+
+    order = await service.set_customer(
+        conn,
+        shop.restaurant_id,
+        draft.id,
+        CustomerDetails(name=" Sam ", phone="(415) 555-2671"),
+    )
+
+    assert order.customer_name == "Sam"
+    assert order.customer_phone == "+14155552671"
+    assert order.revision == 1
+    assert order.status == "draft"
+
+
+# --- read_back --------------------------------------------------------------
+
+
+async def test_read_back_records_the_revision_it_read(
+    conn: asyncpg.Connection, shop: Shop, draft: Order
+) -> None:
+    await add(conn, shop, draft, shop.sandwich, [shop.grilled], quantity=2)
+    await add(conn, shop, draft, shop.fries)
+
+    read = await service.read_back(conn, shop.restaurant_id, draft.id)
+
+    # 2 x 1099 + 399 = 2597; tax 227.24 -> 227.
+    assert read.text == (
+        "Your order: 2 x Chicken Sandwich (Grilled); 1 x Fries. "
+        "Total with tax: $28.24. Pay at pickup. Shall I place it?"
+    )
+    assert read.order.revision == 2
+    assert read.order.read_back_revision == 2
+    stored = await service.get_order(conn, shop.restaurant_id, draft.id)
+    assert stored == read.order
+
+
+async def test_a_change_after_read_back_leaves_it_behind(
+    conn: asyncpg.Connection, shop: Shop, draft: Order
+) -> None:
+    await add(conn, shop, draft, shop.fries)
+    read = await service.read_back(conn, shop.restaurant_id, draft.id)
+
+    order = await add(conn, shop, draft, shop.fries)
+
+    assert order.revision == 2
+    assert order.read_back_revision == read.order.revision == 1
+    with pytest.raises(OrderError) as error:
+        await service.confirm_order(
+            conn, shop.restaurant_id, draft.id, order.read_back_revision, CUSTOMER
+        )
+    assert error.value.code == "order_changed"
+
+
+async def test_read_back_empty_order(
+    conn: asyncpg.Connection, shop: Shop, draft: Order
+) -> None:
+    with pytest.raises(OrderError) as error:
+        await service.read_back(conn, shop.restaurant_id, draft.id)
+
+    assert error.value.code == "order_empty"
+
+
+async def test_read_back_flags_a_line_that_sold_out(
+    conn: asyncpg.Connection, shop: Shop, draft: Order
+) -> None:
+    await add(conn, shop, draft, shop.sandwich, [shop.crispy])
+    order = await add(conn, shop, draft, shop.fries)
+    await conn.execute(
+        "UPDATE menu_items SET is_available = false WHERE id = $1", shop.fries
+    )
+
+    with pytest.raises(LinesUnavailable) as error:
+        await service.read_back(conn, shop.restaurant_id, draft.id)
+
+    assert error.value.code == "lines_unavailable"
+    assert error.value.lines == [order.lines[1]]
+    stored = await service.get_order(conn, shop.restaurant_id, draft.id)
+    assert stored.read_back_revision is None
+
+
+# --- confirm_order ----------------------------------------------------------
+
+
+async def test_confirm_order_places_it_with_the_next_number(
+    conn: asyncpg.Connection, shop: Shop, draft: Order
+) -> None:
+    order = await add(conn, shop, draft, shop.fries)
+
+    placed = await service.confirm_order(
+        conn, shop.restaurant_id, draft.id, order.revision, CUSTOMER
+    )
+
+    assert placed.status == "placed"
+    assert placed.order_number == 1
+    assert placed.placed_at is not None
+    assert placed.customer_name == "Sam"
+    assert placed.customer_phone == "+14155552671"
+    assert placed.revision == order.revision
+    assert placed.lines == order.lines
+    assert_totals(placed, 399, 35)
+
+    second = await service.create_draft(conn, shop.restaurant_id, "web")
+    await add(conn, shop, second, shop.fries)
+    assert (await place_order(conn, shop.restaurant_id, second.id)).order_number == 2
+
+
+async def test_confirm_order_uses_the_customer_set_earlier(
+    conn: asyncpg.Connection, shop: Shop, draft: Order
+) -> None:
+    order = await add(conn, shop, draft, shop.fries)
+    await service.set_customer(conn, shop.restaurant_id, draft.id, CUSTOMER)
+
+    placed = await service.confirm_order(
+        conn, shop.restaurant_id, draft.id, order.revision
+    )
+
+    assert placed.status == "placed"
+    assert placed.customer_name == "Sam"
+
+
+async def test_confirm_order_writes_one_event(
+    conn: asyncpg.Connection, shop: Shop, draft: Order
+) -> None:
+    await add(conn, shop, draft, shop.fries)
+    await place_order(conn, shop.restaurant_id, draft.id)
+
+    events = await conn.fetch(
+        "SELECT * FROM order_events WHERE order_id = $1", draft.id
+    )
+
+    (event,) = events
+    assert event["restaurant_id"] == shop.restaurant_id
+    assert (event["from_status"], event["to_status"]) == ("draft", "placed")
+    assert event["actor_type"] == "customer"
+    assert event["actor_id"] is None
+
+
+async def test_confirm_order_again_returns_the_same_order(
+    conn: asyncpg.Connection, shop: Shop, draft: Order
+) -> None:
+    await add(conn, shop, draft, shop.fries)
+    placed = await place_order(conn, shop.restaurant_id, draft.id)
+
+    for revision in (placed.revision, placed.revision + 5):
+        again = await service.confirm_order(
+            conn,
+            shop.restaurant_id,
+            draft.id,
+            revision,
+            CustomerDetails(name="Someone Else", phone="2125550100"),
+        )
+        assert again == placed
+
+    events = await conn.fetchval(
+        "SELECT count(*) FROM order_events WHERE order_id = $1", draft.id
+    )
+    assert events == 1
+    other = await service.create_draft(conn, shop.restaurant_id, "web")
+    await add(conn, shop, other, shop.fries)
+    assert (await place_order(conn, shop.restaurant_id, other.id)).order_number == 2
+
+
+@pytest.mark.parametrize("offset", [-1, 1])
+async def test_confirm_order_needs_the_current_revision(
+    conn: asyncpg.Connection, shop: Shop, draft: Order, offset: int
+) -> None:
+    order = await add(conn, shop, draft, shop.fries)
+
+    with pytest.raises(OrderError) as error:
+        await service.confirm_order(
+            conn, shop.restaurant_id, draft.id, order.revision + offset, CUSTOMER
+        )
+
+    assert error.value.code == "order_changed"
+    stored = await service.get_order(conn, shop.restaurant_id, draft.id)
+    assert stored.status == "draft"
+    assert stored.customer_name is None
+
+
+async def test_confirm_order_empty_order(
+    conn: asyncpg.Connection, shop: Shop, draft: Order
+) -> None:
+    with pytest.raises(OrderError) as error:
+        await service.confirm_order(conn, shop.restaurant_id, draft.id, 0, CUSTOMER)
+
+    assert error.value.code == "order_empty"
+
+
+async def test_confirm_order_needs_a_customer(
+    conn: asyncpg.Connection, shop: Shop, draft: Order
+) -> None:
+    order = await add(conn, shop, draft, shop.fries)
+
+    with pytest.raises(OrderError) as error:
+        await service.confirm_order(conn, shop.restaurant_id, draft.id, order.revision)
+
+    assert error.value.code == "customer_required"
+
+
+async def test_confirm_order_rejects_a_line_that_sold_out(
+    conn: asyncpg.Connection, shop: Shop, draft: Order
+) -> None:
+    order = await add(conn, shop, draft, shop.sandwich, [shop.grilled, shop.bacon])
+    await conn.execute(
+        "UPDATE modifier_options SET is_available = false WHERE id = $1", shop.bacon
+    )
+
+    with pytest.raises(LinesUnavailable) as error:
+        await service.confirm_order(
+            conn, shop.restaurant_id, draft.id, order.revision, CUSTOMER
+        )
+
+    assert error.value.lines == order.lines
+    stored = await service.get_order(conn, shop.restaurant_id, draft.id)
+    assert stored.status == "draft"
+    assert stored.order_number is None
+    # Nothing of the failed attempt is kept, the customer included.
+    assert stored.customer_name is None
+    counters = await conn.fetchval(
+        "SELECT count(*) FROM order_counters WHERE restaurant_id = $1",
+        shop.restaurant_id,
+    )
+    assert counters == 0
+
+
+async def test_confirm_order_keeps_the_price_the_customer_saw(
+    conn: asyncpg.Connection, shop: Shop, draft: Order
+) -> None:
+    order = await add(conn, shop, draft, shop.fries)
+    await conn.execute(
+        "UPDATE menu_items SET price_cents = 999 WHERE id = $1", shop.fries
+    )
+
+    placed = await place_order(conn, shop.restaurant_id, draft.id)
+
+    assert placed.lines == order.lines
+    assert_totals(placed, 399, 35)
+
+
+async def test_cancelled_draft_cannot_be_placed(
+    conn: asyncpg.Connection, shop: Shop, draft: Order
+) -> None:
+    order = await add(conn, shop, draft, shop.fries)
+    await conn.execute("UPDATE orders SET status = 'cancelled' WHERE id = $1", draft.id)
+
+    with pytest.raises(OrderError) as error:
+        await service.confirm_order(
+            conn, shop.restaurant_id, draft.id, order.revision, CUSTOMER
+        )
+
+    assert error.value.code == "order_not_draft"
+
+
+async def test_order_numbers_count_per_restaurant(
+    conn: asyncpg.Connection, shop: Shop, draft: Order
+) -> None:
+    other = await create_shop(conn, "Other Diner")
+    other_draft = await service.create_draft(conn, other.restaurant_id, "web")
+    await add(conn, shop, draft, shop.fries)
+    await add(conn, other, other_draft, other.fries)
+
+    first = await place_order(conn, shop.restaurant_id, draft.id)
+    other_first = await place_order(conn, other.restaurant_id, other_draft.id)
+
+    assert first.order_number == 1
+    assert other_first.order_number == 1
+
+
+async def test_order_numbers_restart_each_business_date(
+    conn: asyncpg.Connection, shop: Shop
+) -> None:
+    async def take(day: date) -> int:
+        return await repository.next_order_number(conn, shop.restaurant_id, day)
+
+    monday, tuesday = date(2026, 11, 16), date(2026, 11, 17)
+
+    assert [await take(monday), await take(monday), await take(monday)] == [1, 2, 3]
+    assert await take(tuesday) == 1
+    assert await take(monday) == 4
+
+
+async def test_business_date_follows_the_restaurant_timezone(
+    conn: asyncpg.Connection,
+) -> None:
+    # 25 hours apart, so the two are never on the same date.
+    east = await create_shop(conn, "East Diner")
+    west = await create_shop(conn, "West Diner")
+    for shop, timezone in ((east, "Pacific/Kiritimati"), (west, "Pacific/Niue")):
+        await conn.execute(
+            "UPDATE restaurants SET timezone = $2 WHERE id = $1",
+            shop.restaurant_id,
+            timezone,
+        )
+        order = await service.create_draft(conn, shop.restaurant_id, "web")
+        await add(conn, shop, order, shop.fries)
+        await place_order(conn, shop.restaurant_id, order.id)
+
+    dates = await conn.fetch(
+        "SELECT restaurant_id, business_date FROM orders WHERE restaurant_id = ANY($1)",
+        [east.restaurant_id, west.restaurant_id],
+    )
+    by_restaurant = {row["restaurant_id"]: row["business_date"] for row in dates}
+
+    assert (
+        by_restaurant[east.restaurant_id] - by_restaurant[west.restaurant_id]
+    ).days in (1, 2)
 
 
 # --- request models -------------------------------------------------------

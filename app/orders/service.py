@@ -3,6 +3,9 @@
 Every channel (agent tools, storefront cart) changes an order only through these
 functions. Each one runs in its own transaction (a savepoint when the caller
 already has one open) and returns the order as it stands afterwards.
+
+Lines can change only while the order is a draft. `confirm_order` places it,
+and only at the revision the customer agreed to.
 """
 
 from uuid import UUID
@@ -12,9 +15,22 @@ import asyncpg
 from app.menu.models import MenuItem
 from app.menu.repository import fetch_menu
 from app.orders import repository
-from app.orders.errors import OrderError
-from app.orders.models import AddLine, ChangeLine, Channel, Order
-from app.orders.pricing import line_total_cents, select_options, tax_cents
+from app.orders.errors import LinesUnavailable, OrderError
+from app.orders.models import (
+    AddLine,
+    ChangeLine,
+    Channel,
+    CustomerDetails,
+    Order,
+    ReadBack,
+)
+from app.orders.pricing import (
+    line_total_cents,
+    select_options,
+    tax_cents,
+    unavailable_lines,
+)
+from app.orders.readback import read_back_text
 
 
 async def create_draft(
@@ -121,6 +137,91 @@ async def remove_item(
         return await get_order(conn, restaurant_id, order_id)
 
 
+async def set_customer(
+    conn: asyncpg.Connection,
+    restaurant_id: UUID,
+    order_id: UUID,
+    customer: CustomerDetails,
+) -> Order:
+    """Record who picks the order up. The revision stays as it is."""
+    async with conn.transaction():
+        await _lock_draft(conn, restaurant_id, order_id)
+        await repository.update_customer(
+            conn, restaurant_id, order_id, customer.name, customer.phone
+        )
+        return await get_order(conn, restaurant_id, order_id)
+
+
+async def read_back(
+    conn: asyncpg.Connection, restaurant_id: UUID, order_id: UUID
+) -> ReadBack:
+    """Build the read-back of the draft and record which revision was read.
+
+    Raises OrderError if the order is empty, or LinesUnavailable if a line can
+    no longer be made.
+    """
+    async with conn.transaction():
+        await _lock_draft(conn, restaurant_id, order_id)
+        order = await get_order(conn, restaurant_id, order_id)
+        await _check_lines(conn, order)
+        await repository.set_read_back_revision(
+            conn, restaurant_id, order_id, order.revision
+        )
+        order = order.model_copy(update={"read_back_revision": order.revision})
+        return ReadBack(order=order, text=read_back_text(order))
+
+
+async def confirm_order(
+    conn: asyncpg.Connection,
+    restaurant_id: UUID,
+    order_id: UUID,
+    revision: int,
+    customer: CustomerDetails | None = None,
+) -> Order:
+    """Place a draft the customer has agreed to, and give it its order number.
+
+    `revision` is the revision the customer saw or heard; the order is placed
+    only if nothing has changed since. `customer` sets the pickup name and
+    phone in the same step. Confirming an order that was already placed
+    returns it unchanged, so a repeated yes is harmless.
+    """
+    async with conn.transaction():
+        locked = await repository.lock_order(conn, restaurant_id, order_id)
+        if locked is None:
+            raise OrderError("order_not_found", "Order not found")
+        if locked["status"] != "draft":
+            if locked["order_number"] is None:
+                raise OrderError(
+                    "order_not_draft", "This order can no longer be placed"
+                )
+            return await get_order(conn, restaurant_id, order_id)
+        if locked["revision"] != revision:
+            raise OrderError(
+                "order_changed", "The order has changed since it was reviewed"
+            )
+
+        if customer is not None:
+            await repository.update_customer(
+                conn, restaurant_id, order_id, customer.name, customer.phone
+            )
+        order = await get_order(conn, restaurant_id, order_id)
+        await _check_lines(conn, order)
+        if not order.customer_name or not order.customer_phone:
+            raise OrderError(
+                "customer_required", "A pickup name and phone number are needed"
+            )
+
+        business_date = await repository.fetch_business_date(conn, restaurant_id)
+        number = await repository.next_order_number(conn, restaurant_id, business_date)
+        await repository.mark_placed(
+            conn, restaurant_id, order_id, business_date, number
+        )
+        await repository.insert_event(
+            conn, restaurant_id, order_id, "draft", "placed", "customer"
+        )
+        return await get_order(conn, restaurant_id, order_id)
+
+
 async def _tax_rate_bps(conn: asyncpg.Connection, restaurant_id: UUID) -> int:
     row = await repository.fetch_restaurant_tax_rate(conn, restaurant_id)
     if row is None:
@@ -137,11 +238,23 @@ async def _lock_draft(
     conn: asyncpg.Connection, restaurant_id: UUID, order_id: UUID
 ) -> None:
     """Serialize changes to one order, and allow them only while it is a draft."""
-    status = await repository.lock_order_status(conn, restaurant_id, order_id)
-    if status is None:
+    locked = await repository.lock_order(conn, restaurant_id, order_id)
+    if locked is None:
         raise OrderError("order_not_found", "Order not found")
-    if status != "draft":
+    if locked["status"] != "draft":
         raise OrderError("order_not_draft", "This order can no longer be changed")
+
+
+async def _check_lines(conn: asyncpg.Connection, order: Order) -> None:
+    """Reject an order with no lines, or with lines the menu no longer allows."""
+    if not order.lines:
+        raise OrderError("order_empty", "The order has no items yet")
+    menu = await fetch_menu(conn, order.restaurant_id)
+    if menu is None:
+        raise OrderError("restaurant_not_found", "Restaurant not found")
+    lines = unavailable_lines(order, menu)
+    if lines:
+        raise LinesUnavailable(lines)
 
 
 async def _menu_item(

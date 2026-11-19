@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from uuid import uuid4
 
@@ -173,17 +174,134 @@ async def test_cart_is_not_reachable_through_another_restaurant(
         await connection.close()
 
 
-async def test_placed_cart_cannot_change(
+CUSTOMER = {"name": "Sam", "phone": "(415) 555-2671"}
+
+
+async def cart_with_fries(db_client: AsyncClient, shop: Shop) -> dict:
+    cart = (await db_client.post(carts_url(shop))).json()
+    response = await db_client.post(
+        f"{carts_url(shop)}/{cart['id']}/lines",
+        json={"menu_item_id": str(shop.fries)},
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
+async def checkout(db_client: AsyncClient, shop: Shop, cart: dict, **overrides):
+    body = {"revision": cart["revision"], **CUSTOMER, **overrides}
+    return await db_client.post(f"{carts_url(shop)}/{cart['id']}/checkout", json=body)
+
+
+async def test_checkout_places_the_cart(db_client: AsyncClient, shop: Shop) -> None:
+    cart = await cart_with_fries(db_client, shop)
+
+    response = await checkout(db_client, shop, cart)
+
+    assert response.status_code == 200
+    order = response.json()
+    assert order["id"] == cart["id"]
+    assert order["status"] == "placed"
+    assert order["order_number"] == 1
+    assert order["placed_at"] is not None
+    assert order["customer_name"] == "Sam"
+    assert order["customer_phone"] == "+14155552671"
+    assert order["lines"] == cart["lines"]
+    assert order["total_cents"] == cart["total_cents"] == 434
+
+    # The placed order reads the same, a repeat changes nothing, and the next
+    # cart takes the next number.
+    stored = await db_client.get(f"{carts_url(shop)}/{cart['id']}")
+    assert stored.json() == order
+    again = await checkout(db_client, shop, cart, name="Someone Else")
+    assert again.status_code == 200
+    assert again.json() == order
+    second = await checkout(db_client, shop, await cart_with_fries(db_client, shop))
+    assert second.json()["order_number"] == 2
+
+
+async def test_checkout_rejections(db_client: AsyncClient, shop: Shop) -> None:
+    empty = (await db_client.post(carts_url(shop))).json()
+    response = await checkout(db_client, shop, empty)
+    assert response.status_code == 409
+    assert response.json()["code"] == "order_empty"
+
+    cart = await cart_with_fries(db_client, shop)
+
+    stale = await checkout(db_client, shop, cart, revision=cart["revision"] - 1)
+    assert stale.status_code == 409
+    assert stale.json()["code"] == "order_changed"
+
+    # Request-shape errors come from FastAPI's own validation.
+    for bad in ({"phone": "555-2671"}, {"name": "  "}, {"revision": -1}, {"tip": 1}):
+        response = await checkout(db_client, shop, cart, **bad)
+        assert response.status_code == 422, bad
+    no_revision = await db_client.post(
+        f"{carts_url(shop)}/{cart['id']}/checkout", json=CUSTOMER
+    )
+    assert no_revision.status_code == 422
+
+    unknown = await db_client.post(
+        f"{carts_url(shop)}/{uuid4()}/checkout", json={"revision": 1, **CUSTOMER}
+    )
+    assert unknown.status_code == 404
+
+    # None of that placed the cart or kept a customer.
+    stored = (await db_client.get(f"{carts_url(shop)}/{cart['id']}")).json()
+    assert stored["status"] == "draft"
+    assert stored["customer_name"] is None
+
+
+async def test_checkout_reports_lines_that_sold_out(
     db_client: AsyncClient, shop: Shop, test_database_url: str
 ) -> None:
-    cart = (await db_client.post(carts_url(shop))).json()
+    cart = await cart_with_fries(db_client, shop)
     connection = await asyncpg.connect(test_database_url)
     try:
         await connection.execute(
-            "UPDATE orders SET status = 'placed' WHERE id = $1", cart["id"]
+            "UPDATE menu_items SET is_available = false WHERE id = $1", shop.fries
         )
     finally:
         await connection.close()
+
+    response = await checkout(db_client, shop, cart)
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["code"] == "lines_unavailable"
+    assert body["lines"] == cart["lines"]
+
+
+async def test_concurrent_checkouts_get_different_numbers(
+    db_client: AsyncClient, shop: Shop
+) -> None:
+    carts = [await cart_with_fries(db_client, shop) for _ in range(4)]
+
+    responses = await asyncio.gather(
+        *(checkout(db_client, shop, cart) for cart in carts)
+    )
+
+    assert [r.status_code for r in responses] == [200] * 4
+    assert sorted(r.json()["order_number"] for r in responses) == [1, 2, 3, 4]
+
+
+async def test_concurrent_checkouts_of_one_cart_place_it_once(
+    db_client: AsyncClient, shop: Shop
+) -> None:
+    cart = await cart_with_fries(db_client, shop)
+
+    responses = await asyncio.gather(
+        *(checkout(db_client, shop, cart) for _ in range(4))
+    )
+
+    assert [r.status_code for r in responses] == [200] * 4
+    assert {r.json()["order_number"] for r in responses} == {1}
+    next_cart = await cart_with_fries(db_client, shop)
+    assert (await checkout(db_client, shop, next_cart)).json()["order_number"] == 2
+
+
+async def test_placed_cart_cannot_change(db_client: AsyncClient, shop: Shop) -> None:
+    cart = await cart_with_fries(db_client, shop)
+    assert (await checkout(db_client, shop, cart)).status_code == 200
 
     response = await db_client.post(
         f"{carts_url(shop)}/{cart['id']}/lines",

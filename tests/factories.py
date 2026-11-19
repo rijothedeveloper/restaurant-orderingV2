@@ -5,6 +5,9 @@ from uuid import UUID
 
 import asyncpg
 
+from app.orders import service
+from app.orders.models import CustomerDetails, Order
+
 
 async def create_restaurant(conn: asyncpg.Connection, name: str = "Test Diner") -> UUID:
     return await conn.fetchval(
@@ -248,4 +251,17 @@ async def create_shop(conn: asyncpg.Connection, name: str = "Test Diner") -> Sho
             price_delta_cents=100,
             is_available=False,
         ),
+    )
+
+
+CUSTOMER = CustomerDetails(name="Sam", phone="+14155552671")
+
+
+async def place_order(
+    conn: asyncpg.Connection, restaurant_id: UUID, order_id: UUID
+) -> Order:
+    """Place a draft that already has lines, at its current revision."""
+    order = await service.get_order(conn, restaurant_id, order_id)
+    return await service.confirm_order(
+        conn, restaurant_id, order_id, order.revision, CUSTOMER
     )
