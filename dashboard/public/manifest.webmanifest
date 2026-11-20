@@ -1,0 +1,11 @@
+{
+  "name": "Kitchen Dashboard",
+  "short_name": "Kitchen",
+  "start_url": "/dashboard/",
+  "scope": "/dashboard/",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#14171c",
+  "theme_color": "#14171c",
+  "icons": [{ "src": "/dashboard/icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}

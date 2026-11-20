@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     database_url: SecretStr = Field(min_length=1)
     db_pool_min_size: int = Field(default=1, ge=1)
     db_pool_max_size: int = Field(default=5, ge=1)
+    # The built staff dashboard (`npm run build` in dashboard/); served at
+    # /dashboard when the directory exists.
+    dashboard_dir: Path = BASE_DIR / "dashboard" / "out"
 
     @model_validator(mode="after")
     def validate_pool_sizes(self) -> Self:

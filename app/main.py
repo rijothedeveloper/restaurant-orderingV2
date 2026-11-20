@@ -2,6 +2,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from app.api.carts import register_order_error_handler
 from app.api.carts import router as carts_router
@@ -33,4 +34,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(ordering_router)
     app.include_router(staff_router)
     register_order_error_handler(app)
+    if settings.dashboard_dir.is_dir():
+        app.mount(
+            "/dashboard",
+            StaticFiles(directory=settings.dashboard_dir, html=True),
+            name="dashboard",
+        )
     return app
