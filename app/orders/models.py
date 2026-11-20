@@ -30,6 +30,11 @@ OrderStatus = Literal[
     "cancelled",
     "no_show",
 ]
+# What staff can do to a placed order.
+StaffAction = Literal[
+    "accept", "prepare", "ready", "picked_up", "reject", "cancel", "no_show"
+]
+MAX_REASON_LENGTH = 200
 
 
 class OrderLineModifier(BaseModel):
@@ -61,6 +66,8 @@ class Order(BaseModel):
     # The restaurant's IANA timezone, for showing and speaking times.
     timezone: str
     status: OrderStatus
+    # When the order entered that status.
+    status_changed_at: datetime
     channel: Channel
     # Bumped by every change to the lines; pickup name and phone do not count.
     revision: int

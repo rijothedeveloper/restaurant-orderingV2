@@ -8,31 +8,15 @@ import pytest
 from httpx import AsyncClient
 
 from tests.conftest import NOON, FakeClock
-from tests.factories import Shop, create_shop
+from tests.factories import Shop, committed_shop, create_shop
 
 pytestmark = pytest.mark.integration
 
 
 @pytest.fixture
 async def shop(test_database_url: str) -> AsyncIterator[Shop]:
-    """A committed restaurant with a menu; its orders and itself are deleted after."""
-    connection = await asyncpg.connect(test_database_url)
-    restaurant_ids = []
-    try:
-        async with connection.transaction():
-            shop = await create_shop(connection, f"Cart Diner {uuid4()}")
-        restaurant_ids.append(shop.restaurant_id)
+    async with committed_shop(test_database_url, f"Cart Diner {uuid4()}") as shop:
         yield shop
-    finally:
-        for restaurant_id in restaurant_ids:
-            # Orders first: order lines hold references to the menu.
-            await connection.execute(
-                "DELETE FROM orders WHERE restaurant_id = $1", restaurant_id
-            )
-            await connection.execute(
-                "DELETE FROM restaurants WHERE id = $1", restaurant_id
-            )
-        await connection.close()
 
 
 def carts_url(shop: Shop) -> str:

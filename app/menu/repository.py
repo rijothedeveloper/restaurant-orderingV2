@@ -122,3 +122,39 @@ async def fetch_menu(conn: asyncpg.Connection, restaurant_id: UUID) -> Menu | No
         restaurant_name=restaurant["name"],
         categories=list(categories.values()),
     )
+
+
+async def set_item_available(
+    conn: asyncpg.Connection, restaurant_id: UUID, item_id: UUID, is_available: bool
+) -> bool:
+    """Mark an item sold out or back on. False if the item does not exist."""
+    updated = await conn.fetchval(
+        """
+        UPDATE menu_items
+        SET is_available = $3, updated_at = now()
+        WHERE restaurant_id = $1 AND id = $2
+        RETURNING id
+        """,
+        restaurant_id,
+        item_id,
+        is_available,
+    )
+    return updated is not None
+
+
+async def set_option_available(
+    conn: asyncpg.Connection, restaurant_id: UUID, option_id: UUID, is_available: bool
+) -> bool:
+    """Mark an option sold out or back on. False if the option does not exist."""
+    updated = await conn.fetchval(
+        """
+        UPDATE modifier_options
+        SET is_available = $3
+        WHERE restaurant_id = $1 AND id = $2
+        RETURNING id
+        """,
+        restaurant_id,
+        option_id,
+        is_available,
+    )
+    return updated is not None

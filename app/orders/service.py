@@ -5,7 +5,8 @@ functions. Each one runs in its own transaction (a savepoint when the caller
 already has one open) and returns the order as it stands afterwards.
 
 Lines can change only while the order is a draft. `confirm_order` places it,
-and only at the revision the customer agreed to.
+and only at the revision the customer agreed to. After that only staff move it,
+through `apply_staff_action`.
 
 Pickup times are quoted by `app.orders.pickup` from the opening hours, the
 kitchen's load and `clock.utcnow()`. A quote is an estimate until the order is
@@ -29,9 +30,11 @@ from app.orders.models import (
     CustomerDetails,
     Order,
     OrderingStatus,
+    OrderStatus,
     Pickup,
     ReadBack,
     SetPickup,
+    StaffAction,
 )
 from app.orders.pickup import (
     PickupQuote,
@@ -47,6 +50,18 @@ from app.orders.pricing import (
     unavailable_lines,
 )
 from app.orders.readback import read_back_text
+
+# For each staff action: the statuses it can start from, and where it leads.
+# Rejecting or cancelling is possible only until cooking starts.
+STAFF_ACTIONS: dict[StaffAction, tuple[frozenset[OrderStatus], OrderStatus]] = {
+    "accept": (frozenset({"placed"}), "accepted"),
+    "prepare": (frozenset({"accepted"}), "preparing"),
+    "ready": (frozenset({"preparing"}), "ready"),
+    "picked_up": (frozenset({"ready"}), "picked_up"),
+    "reject": (frozenset({"placed"}), "rejected"),
+    "cancel": (frozenset({"placed", "accepted"}), "cancelled"),
+    "no_show": (frozenset({"ready"}), "no_show"),
+}
 
 
 async def create_draft(
@@ -267,6 +282,68 @@ async def confirm_order(
             conn, restaurant_id, order_id, "draft", "placed", "customer"
         )
         return await get_order(conn, restaurant_id, order_id)
+
+
+async def apply_staff_action(
+    conn: asyncpg.Connection,
+    restaurant_id: UUID,
+    order_id: UUID,
+    action: StaffAction,
+    staff_user_id: UUID,
+    *,
+    extra_minutes: int = 0,
+    reason: str | None = None,
+) -> Order:
+    """Move a placed order along its lifecycle, and log who did it.
+
+    `extra_minutes` pushes the promised pickup time back when accepting;
+    `reason` is kept for a reject (which needs one) or a cancel. Repeating an
+    action on an order that is already there returns it unchanged, so a
+    double tap is harmless.
+    """
+    allowed_from, to_status = STAFF_ACTIONS[action]
+    if action == "reject" and not reason:
+        raise OrderError("reason_required", "Rejecting an order needs a reason")
+    async with conn.transaction():
+        locked = await repository.lock_order(conn, restaurant_id, order_id)
+        if locked is None:
+            raise OrderError("order_not_found", "Order not found")
+        from_status = locked["status"]
+        if from_status != to_status:
+            if from_status not in allowed_from:
+                raise OrderError(
+                    "invalid_transition",
+                    f"An order that is {_spoken(from_status)} cannot be moved"
+                    f" to {_spoken(to_status)}",
+                )
+            await repository.update_status(
+                conn,
+                restaurant_id,
+                order_id,
+                to_status,
+                extra_minutes if action == "accept" else 0,
+            )
+            await repository.insert_event(
+                conn,
+                restaurant_id,
+                order_id,
+                from_status,
+                to_status,
+                "staff",
+                actor_id=staff_user_id,
+                reason=reason if action in ("reject", "cancel") else None,
+            )
+        return await get_order(conn, restaurant_id, order_id)
+
+
+async def active_orders(conn: asyncpg.Connection, restaurant_id: UUID) -> list[Order]:
+    """The orders staff still have to act on, soonest pickup first."""
+    order_ids = await repository.fetch_active_order_ids(conn, restaurant_id)
+    return await repository.fetch_orders(conn, restaurant_id, order_ids)
+
+
+def _spoken(status: str) -> str:
+    return status.replace("_", " ")
 
 
 async def ordering_status(

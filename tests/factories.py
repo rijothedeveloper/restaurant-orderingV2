@@ -1,6 +1,7 @@
 """Insert helpers for integration tests. Each returns the new row's id."""
 
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import time
 from uuid import UUID
@@ -9,6 +10,8 @@ import asyncpg
 
 from app.orders import service
 from app.orders.models import CustomerDetails, Order
+from app.staff import service as staff_service
+from app.staff.models import StaffUser
 
 
 async def create_restaurant(conn: asyncpg.Connection, name: str = "Test Diner") -> UUID:
@@ -304,3 +307,40 @@ async def place_order(
     return await service.confirm_order(
         conn, restaurant_id, order_id, order.revision, CUSTOMER
     )
+
+
+STAFF_PIN = "246810"
+
+
+async def create_staff(
+    conn: asyncpg.Connection,
+    restaurant_id: UUID,
+    name: str = "Alex",
+    pin: str = STAFF_PIN,
+) -> StaffUser:
+    return await staff_service.create_staff_user(conn, restaurant_id, name, pin)
+
+
+@asynccontextmanager
+async def committed_shop(database_url: str, name: str) -> AsyncIterator[Shop]:
+    """A committed shop, for tests that go through the app's own pool.
+
+    Its orders and the restaurant itself are deleted afterwards.
+    """
+    connection = await asyncpg.connect(database_url)
+    restaurant_id = None
+    try:
+        async with connection.transaction():
+            shop = await create_shop(connection, name)
+        restaurant_id = shop.restaurant_id
+        yield shop
+    finally:
+        if restaurant_id is not None:
+            # Orders first: order lines hold references to the menu.
+            await connection.execute(
+                "DELETE FROM orders WHERE restaurant_id = $1", restaurant_id
+            )
+            await connection.execute(
+                "DELETE FROM restaurants WHERE id = $1", restaurant_id
+            )
+        await connection.close()

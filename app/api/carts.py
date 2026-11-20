@@ -42,6 +42,7 @@ ERROR_STATUS = {
     "order_not_draft": 409,
     "restaurant_not_configured": 409,
     "order_changed": 409,
+    "invalid_transition": 409,
     "order_empty": 409,
     "customer_required": 409,
     "lines_unavailable": 409,

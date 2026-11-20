@@ -380,7 +380,8 @@ async def mark_placed(
         """
         UPDATE orders
         SET status = 'placed', business_date = $3, order_number = $4,
-            promised_pickup_at = $5, placed_at = now(), updated_at = now()
+            promised_pickup_at = $5, placed_at = now(),
+            status_changed_at = now(), updated_at = now()
         WHERE restaurant_id = $1 AND id = $2
         """,
         restaurant_id,
@@ -398,51 +399,106 @@ async def insert_event(
     from_status: str,
     to_status: str,
     actor_type: str,
+    *,
+    actor_id: UUID | None = None,
+    reason: str | None = None,
 ) -> None:
+    """Log a status change. `actor_id` is the staff user when staff made it."""
     await conn.execute(
         """
         INSERT INTO order_events (restaurant_id, order_id, from_status, to_status,
-                                  actor_type)
-        VALUES ($1, $2, $3, $4, $5)
+                                  actor_type, actor_id, reason)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         """,
         restaurant_id,
         order_id,
         from_status,
         to_status,
         actor_type,
+        actor_id,
+        reason,
     )
+
+
+async def update_status(
+    conn: asyncpg.Connection,
+    restaurant_id: UUID,
+    order_id: UUID,
+    status: str,
+    extra_minutes: int = 0,
+) -> None:
+    """Move a placed order to `status`, pushing its promised pickup time back."""
+    await conn.execute(
+        """
+        UPDATE orders
+        SET status = $3,
+            promised_pickup_at = promised_pickup_at + make_interval(mins => $4),
+            status_changed_at = now(), updated_at = now()
+        WHERE restaurant_id = $1 AND id = $2
+        """,
+        restaurant_id,
+        order_id,
+        status,
+        extra_minutes,
+    )
+
+
+async def fetch_active_order_ids(
+    conn: asyncpg.Connection, restaurant_id: UUID
+) -> list[UUID]:
+    """Orders staff still have to act on, soonest pickup first."""
+    rows = await conn.fetch(
+        """
+        SELECT id
+        FROM orders
+        WHERE restaurant_id = $1
+          AND status IN ('placed', 'accepted', 'preparing', 'ready')
+        ORDER BY promised_pickup_at, business_date, order_number
+        """,
+        restaurant_id,
+    )
+    return [row["id"] for row in rows]
 
 
 async def fetch_order(
     conn: asyncpg.Connection, restaurant_id: UUID, order_id: UUID
 ) -> Order | None:
-    order = await conn.fetchrow(
+    orders = await fetch_orders(conn, restaurant_id, [order_id])
+    return orders[0] if orders else None
+
+
+async def fetch_orders(
+    conn: asyncpg.Connection, restaurant_id: UUID, order_ids: list[UUID]
+) -> list[Order]:
+    """The orders with these ids, in the order given. Unknown ids are skipped."""
+    order_rows = await conn.fetch(
         """
-        SELECT o.id, o.restaurant_id, r.timezone, o.status, o.channel, o.revision,
+        SELECT o.id, o.restaurant_id, r.timezone, o.status, o.status_changed_at,
+               o.channel, o.revision,
                o.read_back_revision, o.order_number, o.placed_at,
                o.requested_pickup_at, o.promised_pickup_at,
                o.customer_name, o.customer_phone,
                o.subtotal_cents, o.tax_rate_bps, o.tax_cents, o.total_cents
         FROM orders AS o
         JOIN restaurants AS r ON r.id = o.restaurant_id
-        WHERE o.restaurant_id = $1 AND o.id = $2
+        WHERE o.restaurant_id = $1 AND o.id = ANY($2::uuid[])
         """,
         restaurant_id,
-        order_id,
+        order_ids,
     )
-    if order is None:
-        return None
+    if not order_rows:
+        return []
 
     line_rows = await conn.fetch(
         """
-        SELECT id, menu_item_id, item_name, quantity, unit_price_cents,
+        SELECT id, order_id, menu_item_id, item_name, quantity, unit_price_cents,
                modifier_total_cents, line_total_cents, notes
         FROM order_items
-        WHERE restaurant_id = $1 AND order_id = $2
+        WHERE restaurant_id = $1 AND order_id = ANY($2::uuid[])
         ORDER BY seq
         """,
         restaurant_id,
-        order_id,
+        order_ids,
     )
     modifier_rows = await conn.fetch(
         """
@@ -451,11 +507,11 @@ async def fetch_order(
         FROM order_item_modifiers AS m
         JOIN order_items AS i
           ON i.restaurant_id = m.restaurant_id AND i.id = m.order_item_id
-        WHERE i.restaurant_id = $1 AND i.order_id = $2
+        WHERE i.restaurant_id = $1 AND i.order_id = ANY($2::uuid[])
         ORDER BY m.seq
         """,
         restaurant_id,
-        order_id,
+        order_ids,
     )
 
     modifiers_by_line: dict[UUID, list[OrderLineModifier]] = {}
@@ -470,25 +526,9 @@ async def fetch_order(
             )
         )
 
-    return Order(
-        id=order["id"],
-        restaurant_id=order["restaurant_id"],
-        timezone=order["timezone"],
-        status=order["status"],
-        channel=order["channel"],
-        revision=order["revision"],
-        read_back_revision=order["read_back_revision"],
-        order_number=order["order_number"],
-        placed_at=order["placed_at"],
-        requested_pickup_at=order["requested_pickup_at"],
-        promised_pickup_at=order["promised_pickup_at"],
-        customer_name=order["customer_name"],
-        customer_phone=order["customer_phone"],
-        subtotal_cents=order["subtotal_cents"],
-        tax_rate_bps=order["tax_rate_bps"],
-        tax_cents=order["tax_cents"],
-        total_cents=order["total_cents"],
-        lines=[
+    lines_by_order: dict[UUID, list[OrderLine]] = {}
+    for row in line_rows:
+        lines_by_order.setdefault(row["order_id"], []).append(
             OrderLine(
                 id=row["id"],
                 menu_item_id=row["menu_item_id"],
@@ -500,6 +540,30 @@ async def fetch_order(
                 notes=row["notes"],
                 modifiers=modifiers_by_line.get(row["id"], []),
             )
-            for row in line_rows
-        ],
-    )
+        )
+
+    orders = {
+        order["id"]: Order(
+            id=order["id"],
+            restaurant_id=order["restaurant_id"],
+            timezone=order["timezone"],
+            status=order["status"],
+            status_changed_at=order["status_changed_at"],
+            channel=order["channel"],
+            revision=order["revision"],
+            read_back_revision=order["read_back_revision"],
+            order_number=order["order_number"],
+            placed_at=order["placed_at"],
+            requested_pickup_at=order["requested_pickup_at"],
+            promised_pickup_at=order["promised_pickup_at"],
+            customer_name=order["customer_name"],
+            customer_phone=order["customer_phone"],
+            subtotal_cents=order["subtotal_cents"],
+            tax_rate_bps=order["tax_rate_bps"],
+            tax_cents=order["tax_cents"],
+            total_cents=order["total_cents"],
+            lines=lines_by_order.get(order["id"], []),
+        )
+        for order in order_rows
+    }
+    return [orders[order_id] for order_id in order_ids if order_id in orders]
