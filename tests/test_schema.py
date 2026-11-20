@@ -36,6 +36,9 @@ async def test_tables_exist(conn: asyncpg.Connection) -> None:
         "order_counters",
         "order_events",
         "opening_hours",
+        "staff_users",
+        "staff_sessions",
+        "staff_login_throttle",
     } <= tables
 
 

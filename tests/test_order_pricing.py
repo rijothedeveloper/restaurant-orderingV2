@@ -223,6 +223,7 @@ def make_order(*lines: OrderLine) -> Order:
         restaurant_id=uuid4(),
         timezone="America/Los_Angeles",
         status="draft",
+        status_changed_at=datetime(2026, 11, 18, 20, 0, tzinfo=UTC),
         channel="web",
         revision=len(lines),
         lines=list(lines),
