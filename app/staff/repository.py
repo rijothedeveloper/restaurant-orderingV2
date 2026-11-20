@@ -5,7 +5,13 @@ from uuid import UUID
 
 import asyncpg
 
-from app.staff.models import Controls, StaffUser
+from app.staff.models import (
+    Controls,
+    KitchenSettings,
+    OpenHours,
+    StaffMember,
+    StaffUser,
+)
 
 
 async def restaurant_exists(conn: asyncpg.Connection, restaurant_id: UUID) -> bool:
@@ -15,27 +21,28 @@ async def restaurant_exists(conn: asyncpg.Connection, restaurant_id: UUID) -> bo
 
 
 async def insert_staff_user(
-    conn: asyncpg.Connection, restaurant_id: UUID, name: str, pin_hash: str
+    conn: asyncpg.Connection, restaurant_id: UUID, name: str, pin_hash: str, role: str
 ) -> UUID:
     return await conn.fetchval(
         """
-        INSERT INTO staff_users (restaurant_id, name, pin_hash)
-        VALUES ($1, $2, $3)
+        INSERT INTO staff_users (restaurant_id, name, pin_hash, role)
+        VALUES ($1, $2, $3, $4)
         RETURNING id
         """,
         restaurant_id,
         name,
         pin_hash,
+        role,
     )
 
 
 async def fetch_active_staff(
     conn: asyncpg.Connection, restaurant_id: UUID
 ) -> list[asyncpg.Record]:
-    """id, name and pin_hash of the staff who can sign in, oldest first."""
+    """id, name, role and pin_hash of the staff who can sign in, oldest first."""
     return await conn.fetch(
         """
-        SELECT id, name, pin_hash
+        SELECT id, name, role, pin_hash
         FROM staff_users
         WHERE restaurant_id = $1 AND is_active
         ORDER BY created_at, id
@@ -107,7 +114,7 @@ async def fetch_session_staff(
     """The active staff user behind an unexpired session of this restaurant."""
     row = await conn.fetchrow(
         """
-        SELECT u.id, u.restaurant_id, u.name
+        SELECT u.id, u.restaurant_id, u.name, u.role
         FROM staff_sessions AS s
         JOIN staff_users AS u
           ON u.restaurant_id = s.restaurant_id AND u.id = s.staff_user_id
@@ -167,3 +174,146 @@ async def update_controls(
         busy_extra_minutes,
     )
     return Controls(**row) if row is not None else None
+
+
+async def fetch_staff(
+    conn: asyncpg.Connection, restaurant_id: UUID
+) -> list[StaffMember]:
+    """Everyone, active first, then by name."""
+    rows = await conn.fetch(
+        """
+        SELECT id, name, role, is_active
+        FROM staff_users
+        WHERE restaurant_id = $1
+        ORDER BY is_active DESC, lower(name), id
+        """,
+        restaurant_id,
+    )
+    return [StaffMember(**row) for row in rows]
+
+
+async def fetch_staff_member(
+    conn: asyncpg.Connection, restaurant_id: UUID, staff_user_id: UUID
+) -> StaffMember | None:
+    row = await conn.fetchrow(
+        """
+        SELECT id, name, role, is_active
+        FROM staff_users
+        WHERE restaurant_id = $1 AND id = $2
+        """,
+        restaurant_id,
+        staff_user_id,
+    )
+    return StaffMember(**row) if row is not None else None
+
+
+async def update_staff_user(
+    conn: asyncpg.Connection,
+    restaurant_id: UUID,
+    staff_user_id: UUID,
+    name: str,
+    role: str,
+    is_active: bool,
+    pin_hash: str | None,
+) -> None:
+    """Set name, role and active flag, and the PIN hash unless it is None."""
+    await conn.execute(
+        """
+        UPDATE staff_users
+        SET name = $3, role = $4, is_active = $5,
+            pin_hash = COALESCE($6, pin_hash), updated_at = now()
+        WHERE restaurant_id = $1 AND id = $2
+        """,
+        restaurant_id,
+        staff_user_id,
+        name,
+        role,
+        is_active,
+        pin_hash,
+    )
+
+
+async def delete_staff_sessions(
+    conn: asyncpg.Connection, restaurant_id: UUID, staff_user_id: UUID
+) -> None:
+    await conn.execute(
+        """
+        DELETE FROM staff_sessions
+        WHERE restaurant_id = $1 AND staff_user_id = $2
+        """,
+        restaurant_id,
+        staff_user_id,
+    )
+
+
+async def fetch_restaurant(
+    conn: asyncpg.Connection, restaurant_id: UUID
+) -> asyncpg.Record | None:
+    return await conn.fetchrow(
+        "SELECT name, timezone FROM restaurants WHERE id = $1", restaurant_id
+    )
+
+
+async def fetch_kitchen_settings(
+    conn: asyncpg.Connection, restaurant_id: UUID
+) -> KitchenSettings | None:
+    row = await conn.fetchrow(
+        """
+        SELECT tax_rate_bps, kitchen_capacity, last_order_minutes
+        FROM settings
+        WHERE restaurant_id = $1
+        """,
+        restaurant_id,
+    )
+    return KitchenSettings(**row) if row is not None else None
+
+
+async def update_kitchen_settings(
+    conn: asyncpg.Connection, restaurant_id: UUID, settings: KitchenSettings
+) -> bool:
+    """False without a settings row."""
+    updated = await conn.fetchval(
+        """
+        UPDATE settings
+        SET tax_rate_bps = $2, kitchen_capacity = $3, last_order_minutes = $4,
+            updated_at = now()
+        WHERE restaurant_id = $1
+        RETURNING restaurant_id
+        """,
+        restaurant_id,
+        settings.tax_rate_bps,
+        settings.kitchen_capacity,
+        settings.last_order_minutes,
+    )
+    return updated is not None
+
+
+async def fetch_hours(conn: asyncpg.Connection, restaurant_id: UUID) -> list[OpenHours]:
+    rows = await conn.fetch(
+        """
+        SELECT weekday, opens_at, closes_at
+        FROM opening_hours
+        WHERE restaurant_id = $1
+        ORDER BY weekday, opens_at
+        """,
+        restaurant_id,
+    )
+    return [OpenHours(**row) for row in rows]
+
+
+async def replace_hours(
+    conn: asyncpg.Connection, restaurant_id: UUID, hours: list[OpenHours]
+) -> None:
+    await conn.execute(
+        "DELETE FROM opening_hours WHERE restaurant_id = $1", restaurant_id
+    )
+    await conn.executemany(
+        """
+        INSERT INTO opening_hours (restaurant_id, weekday, opens_at, closes_at)
+        VALUES ($1, $2, $3, $4)
+        """,
+        [
+            (restaurant_id, window.weekday, window.opens_at, window.closes_at)
+            for window in hours
+        ],
+    )

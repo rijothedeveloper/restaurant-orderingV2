@@ -115,8 +115,9 @@ VALUES
     ('00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000020007', '00000000-0000-4000-8000-000000030002', 10),
     ('00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000020008', '00000000-0000-4000-8000-000000030002', 10)
 ON CONFLICT (menu_item_id, group_id) DO NOTHING;
--- Demo staff user for the dashboard. PIN 123456: local development only.
-INSERT INTO staff_users (id, restaurant_id, name, pin_hash)
+-- Demo manager for the dashboard. PIN 123456: local development only.
+INSERT INTO staff_users (id, restaurant_id, name, pin_hash, role)
 VALUES ('00000000-0000-4000-8000-000000050001', '00000000-0000-4000-8000-000000000001',
-        'Demo Manager', 'scrypt$16384$8$1$PwG+ETBhK99UssMcgGsTFw==$9VncbuuJk3lm0zXKYB8sdkOUB8Y7mGYd7I5IN+lr4Vs=')
+        'Demo Manager', 'scrypt$16384$8$1$PwG+ETBhK99UssMcgGsTFw==$9VncbuuJk3lm0zXKYB8sdkOUB8Y7mGYd7I5IN+lr4Vs=',
+        'manager')
 ON CONFLICT (id) DO NOTHING;

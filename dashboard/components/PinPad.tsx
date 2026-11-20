@@ -31,7 +31,11 @@ export function PinPad({
     setBusy(true);
     try {
       const session = await login(restaurantId, pin);
-      onSignedIn({ token: session.token, name: session.staff.name });
+      onSignedIn({
+        token: session.token,
+        name: session.staff.name,
+        role: session.staff.role,
+      });
     } catch (caught) {
       setPin("");
       setError(loginMessage(caught));

@@ -101,3 +101,64 @@ export function useWakeLock(): void {
     };
   }, []);
 }
+
+const NOT_SENT = "That did not go through. Check the connection and try again.";
+
+/**
+ * Runs a manager's requests for one screen or dialog. `attempt` resolves to
+ * whether the request went through; a failure is kept in `error` for the
+ * screen to show, and a 401 signs the tablet out.
+ */
+export function useAttempt(onSignedOut: () => void) {
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const attempt = useCallback(
+    async (request: () => Promise<unknown>): Promise<boolean> => {
+      setBusy(true);
+      setError(null);
+      try {
+        await request();
+        return true;
+      } catch (caught) {
+        if (caught instanceof ApiError && caught.status === 401) onSignedOut();
+        else setError(caught instanceof ApiError ? caught.message : NOT_SENT);
+        return false;
+      } finally {
+        setBusy(false);
+      }
+    },
+    [onSignedOut],
+  );
+
+  return { error, busy, attempt };
+}
+
+/** Loads once per `load` identity (so pass a memoized function) and on `reload`. */
+export function useLoaded<T>(load: () => Promise<T>, onSignedOut: () => void) {
+  const [data, setData] = useState<T | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [version, setVersion] = useState(0);
+  const reload = useCallback(() => setVersion((count) => count + 1), []);
+
+  useEffect(() => {
+    let current = true;
+    load().then(
+      (loaded) => {
+        if (!current) return;
+        setData(loaded);
+        setFailed(false);
+      },
+      (caught) => {
+        if (!current) return;
+        if (caught instanceof ApiError && caught.status === 401) onSignedOut();
+        else setFailed(true);
+      },
+    );
+    return () => {
+      current = false;
+    };
+  }, [load, onSignedOut, version]);
+
+  return { data, setData, failed, reload };
+}

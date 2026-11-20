@@ -50,5 +50,12 @@ function SignedInOrOut({ restaurantId }: { restaurantId: string }) {
   if (session === null || api === null) {
     return <PinPad restaurantId={restaurantId} onSignedIn={store} />;
   }
-  return <Dashboard api={api} staffName={session.name} onSignedOut={signOut} />;
+  return (
+    <Dashboard
+      api={api}
+      staffName={session.name}
+      isManager={session.role === "manager"}
+      onSignedOut={signOut}
+    />
+  );
 }

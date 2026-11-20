@@ -76,6 +76,27 @@ def open_period(rules: PickupRules, now: datetime) -> OpenPeriod | None:
     return OpenPeriod(current.opens, closes, current.business_date)
 
 
+def windows_overlap(windows: Sequence[OpenWindow]) -> bool:
+    """Whether two windows of a week share any time. Touching is allowed."""
+    week = 7 * 24 * 60
+    spans = []
+    for window in windows:
+        opens = window.opens_at.hour * 60 + window.opens_at.minute
+        closes = window.closes_at.hour * 60 + window.closes_at.minute
+        # closes <= opens runs into the next day; equal is a full day.
+        length = (closes - opens - 1) % (24 * 60) + 1
+        spans.append((window.weekday * 24 * 60 + opens, length))
+    spans.sort()
+    for index, (start, length) in enumerate(spans):
+        # The window after the last one is the first one, a week later.
+        following = spans[(index + 1) % len(spans)][0]
+        if index == len(spans) - 1:
+            following += week
+        if start + length > following:
+            return True
+    return False
+
+
 def next_opening(rules: PickupRules, at: datetime) -> datetime | None:
     """The first time the restaurant opens at or after `at`, if it ever does."""
     for period in _periods(rules, at):
