@@ -1,5 +1,7 @@
 // Where the dashboard keeps its restaurant and sign-in between reloads.
 
+import type { Role } from "./api";
+
 const RESTAURANT_KEY = "dashboard.restaurant";
 const sessionKey = (restaurantId: string) => `dashboard.session.${restaurantId}`;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -17,13 +19,16 @@ export function restaurantId(): string | null {
 export interface StoredSession {
   token: string;
   name: string;
+  // Decides which screens are offered; the API checks the role itself.
+  role: Role;
 }
 
 export function loadSession(restaurantId: string): StoredSession | null {
   try {
     const stored = JSON.parse(localStorage.getItem(sessionKey(restaurantId)) ?? "null");
     if (typeof stored?.token === "string" && typeof stored?.name === "string") {
-      return { token: stored.token, name: stored.name };
+      const role: Role = stored.role === "manager" ? "manager" : "staff";
+      return { token: stored.token, name: stored.name, role };
     }
   } catch {
     // Not JSON: treat as signed out.

@@ -6,19 +6,22 @@ import { ApiError, type Controls, type StaffApi } from "@/lib/api";
 import { useBoard, useChime, useNow } from "@/lib/hooks";
 import { soundReady, unlockSound } from "@/lib/sound";
 
+import { Admin } from "./Admin";
 import { BoardView } from "./BoardView";
 import { ControlsBar } from "./ControlsBar";
 import { SoldOut } from "./SoldOut";
 
-type View = "orders" | "menu";
+type View = "orders" | "menu" | "admin";
 
 export function Dashboard({
   api,
   staffName,
+  isManager,
   onSignedOut,
 }: {
   api: StaffApi;
   staffName: string;
+  isManager: boolean;
   onSignedOut: () => void;
 }) {
   const [view, setView] = useState<View>("orders");
@@ -78,6 +81,14 @@ export function Dashboard({
           >
             Sold out
           </button>
+          {isManager && (
+            <button
+              className={view === "admin" ? "tab active" : "tab"}
+              onClick={() => setView("admin")}
+            >
+              Manage
+            </button>
+          )}
         </nav>
         {controls !== null && (
           <ControlsBar
@@ -125,8 +136,10 @@ export function Dashboard({
             }
           />
         )
-      ) : (
+      ) : view === "menu" ? (
         <SoldOut api={api} run={run} />
+      ) : (
+        <Admin api={api} onSignedOut={onSignedOut} />
       )}
     </div>
   );

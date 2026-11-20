@@ -11,7 +11,7 @@ import asyncpg
 from app.orders import service
 from app.orders.models import CustomerDetails, Order
 from app.staff import service as staff_service
-from app.staff.models import StaffUser
+from app.staff.models import Role, StaffUser
 
 
 async def create_restaurant(conn: asyncpg.Connection, name: str = "Test Diner") -> UUID:
@@ -317,8 +317,9 @@ async def create_staff(
     restaurant_id: UUID,
     name: str = "Alex",
     pin: str = STAFF_PIN,
+    role: Role = "staff",
 ) -> StaffUser:
-    return await staff_service.create_staff_user(conn, restaurant_id, name, pin)
+    return await staff_service.create_staff_user(conn, restaurant_id, name, pin, role)
 
 
 @asynccontextmanager

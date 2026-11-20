@@ -1,19 +1,30 @@
-from datetime import datetime
-from typing import Literal, Self
+from datetime import datetime, time
+from typing import Annotated, Literal, Self
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
 
 from app.orders.models import MAX_REASON_LENGTH, Order
 
 # Long enough that guessing runs into the sign-in lock first.
 PIN_PATTERN = r"^[0-9]{6,8}$"
 
+# A manager can also manage staff, the menu, hours and settings.
+Role = Literal["manager", "staff"]
+StaffName = Annotated[str, StringConstraints(min_length=1, max_length=80)]
+
 
 class StaffUser(BaseModel):
     id: UUID
     restaurant_id: UUID
     name: str
+    role: Role
 
 
 class Login(BaseModel):
@@ -78,3 +89,84 @@ class Availability(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     is_available: bool
+
+
+class StaffMember(BaseModel):
+    """A staff user as a manager sees them. The PIN is never shown."""
+
+    id: UUID
+    name: str
+    role: Role
+    is_active: bool
+
+
+class NewStaff(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: StaffName
+    pin: str = Field(pattern=PIN_PATTERN)
+    role: Role = "staff"
+
+
+class StaffChange(BaseModel):
+    """A partial change. Fields that are not sent stay as they are.
+
+    A new PIN, or `is_active` false, signs the person out everywhere. Turning
+    someone back on needs a new PIN.
+    """
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: StaffName | None = None
+    role: Role | None = None
+    pin: str | None = Field(default=None, pattern=PIN_PATTERN)
+    is_active: bool | None = None
+
+
+class OpenHours(BaseModel):
+    """One opening window, in the restaurant's local time.
+
+    `weekday` is the day it opens, 0 = Monday. `closes_at` at or before
+    `opens_at` means it closes the next day.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    weekday: int = Field(ge=0, le=6)
+    opens_at: time
+    closes_at: time
+
+    @model_validator(mode="after")
+    def whole_minutes(self) -> Self:
+        for at in (self.opens_at, self.closes_at):
+            if at.second or at.microsecond or at.tzinfo is not None:
+                raise ValueError("times are local, in whole minutes")
+        return self
+
+
+class HoursChange(BaseModel):
+    """The whole week; it replaces the hours there were."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hours: list[OpenHours] = Field(max_length=50)
+
+
+class KitchenSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # 875 = 8.75%.
+    tax_rate_bps: int = Field(ge=0, le=10000)
+    # Orders the kitchen finishes per 10 minutes.
+    kitchen_capacity: int = Field(ge=1, le=100)
+    # No new orders in the last minutes before closing.
+    last_order_minutes: int = Field(ge=0, le=240)
+
+
+class RestaurantSetup(BaseModel):
+    """What the settings screen shows."""
+
+    restaurant_name: str
+    timezone: str
+    settings: KitchenSettings
+    hours: list[OpenHours]

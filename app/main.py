@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from app.api.admin import router as admin_router
 from app.api.carts import register_order_error_handler
 from app.api.carts import router as carts_router
 from app.api.health import router as health_router
@@ -33,6 +34,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(carts_router)
     app.include_router(ordering_router)
     app.include_router(staff_router)
+    app.include_router(admin_router)
     register_order_error_handler(app)
     if settings.dashboard_dir.is_dir():
         app.mount(
