@@ -31,6 +31,11 @@ uv run pytest                           # unit only; integration tests skip
 uv run --env-file .env pytest           # include integration tests
 uv run pytest tests/test_health.py::test_health_ok
 uv run ruff check . && uv run ruff format .
+# staff dashboard (Next.js, in dashboard/)
+npm --prefix dashboard install
+npm --prefix dashboard run build        # static files in dashboard/out, served by the API at /dashboard/
+npm --prefix dashboard run dev          # http://localhost:3000/dashboard/?r=<restaurant id>; proxies /restaurants to API_ORIGIN (default http://127.0.0.1:8000)
+npm --prefix dashboard test && npm --prefix dashboard run lint
 ```
 
 ## Layout
@@ -51,7 +56,8 @@ uv run ruff check . && uv run ruff format .
 - Staff status changes: `service.apply_staff_action(…, action, staff_user_id, extra_minutes=0, reason=None)` moves a placed order by the `STAFF_ACTIONS` table (`accept`, `prepare`, `ready`, `picked_up`, `reject` from placed only and with a reason, `cancel` from placed or accepted, `no_show` from ready) and writes an `order_events` row with the staff actor. Any other move raises `invalid_transition` (409); repeating an action returns the order unchanged. `accept` can push `promised_pickup_at` back 5 or 10 minutes. `service.active_orders` lists the board (placed to ready, soonest pickup first)
 - Staff: `app/staff/` (`service.py` sign-in and controls, `pins.py` scrypt hashing, SQL in `repository.py`). `login` takes a PIN alone (6–8 digits, unique among a restaurant's active staff) and returns a session token; only its SHA-256 is stored, it lasts 12 hours and is good only for its own restaurant. Wrong PINs are counted per restaurant (`staff_login_throttle`): 5 in a row lock sign-in for 5 minutes. No route creates staff yet; use `create_staff_user`
 - Staff routes (`app/api/staff.py`, `/restaurants/{id}/staff…`, `Authorization: Bearer <token>` via `Depends(current_staff)`): `POST login`, `POST logout`, `GET orders` (board plus controls, what the dashboard polls), `POST orders/{order_id}/{action}`, `GET`/`PATCH controls` (pause = `accepting_orders`, busy mode = `busy_extra_minutes`), `PATCH menu/items/{id}` and `menu/options/{id}` (sold-out toggle)
-- Not built yet: the dashboard UI, the `customers` table, outbox and notifications (no status texts), automatic no-show, draft expiry, full menu editing, the agent loop
+- Dashboard: `dashboard/` is a Next.js app exported to static files (`basePath` `/dashboard`); `create_app()` mounts `settings.dashboard_dir` (default `dashboard/out`) at `/dashboard` when it exists, so the app and API share an origin. One client-only page: `components/App.tsx` picks the restaurant from `?r=<id>` (remembered in localStorage) and shows `PinPad` or `Dashboard`. `lib/api.ts` is the staff API client, `lib/hooks.ts` polls the board every 5 s (`useBoard`), chimes while an order is unaccepted (`useChime`) and holds a screen wake lock, and `lib/board.ts` holds the rules with no React (columns, next step, reject/cancel, no-show after 30 minutes, pickup timer), tested with vitest. A 401 on any staff call signs the tablet out. `dashboard/AGENTS.md` is written by Next.js: read the bundled docs in `node_modules/next/dist/docs/` before changing Next.js code
+- Not built yet: staff and menu admin screens, the `customers` table, outbox and notifications (no status texts), automatic no-show, draft expiry, full menu editing, the agent loop
 - `db/seed.sql`: demo restaurant with fixed id `00000000-0000-4000-8000-000000000001`; placeholder menu, open 07:00–23:00 every day, a demo staff user with PIN `123456`, idempotent
 - Tests: `tests/factories.py` has insert helpers, `place_order`, `create_staff` (PIN `STAFF_PIN`) and `committed_shop` (a committed shop for `db_client` tests, deleted afterwards); `conn` fixture = rolled-back transaction (cannot nest a transaction with its own isolation level); `db_client` fixture = real app on the test DB, sees only committed rows, so those tests commit and delete their own data. The autouse `clock` fixture fixes the time at `NOON` (a Wednesday, noon in Los Angeles); `create_shop` is open 09:00–21:00, and a test moves time with `clock.now = …`
 - Integration tests are marked `@pytest.mark.integration` and need a migrated `TEST_DATABASE_URL`; schema tests run inside a rolled-back transaction
